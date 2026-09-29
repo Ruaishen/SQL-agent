@@ -1,0 +1,9 @@
+# Direct project and test dependencies. Install training dependencies with `.[train]`.
+pydantic==2.13.4
+PyYAML==6.0.2
+sqlglot==30.17.0
+apted==1.0.3
+tokenizers==0.22.2
+typer==0.27.0
+pytest==9.1.1
+ruff==0.15.22

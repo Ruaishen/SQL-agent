@@ -1,0 +1,14 @@
+student_model: /root/autodl-tmp/Qwen2.5-Coder-3B-Instruct
+dataset_dir: /root/autodl-tmp/sqlagent/sql-agent-rl/artifacts/sql_planner/spider_filtered_correct_sft
+output_dir: /root/autodl-tmp/sqlagent/sql-agent-rl/artifacts/sql_planner/spider_correct_qwen25_coder_3b_sft
+seed: 42
+epochs: 2
+effective_batch_size: 64
+micro_batch_size: 1
+max_sequence_tokens: 16384
+learning_rate: 5.0e-6
+warmup_steps: 5
+gradient_clip_norm: 1.0
+weight_decay: 0.0
+gradient_checkpointing: true
+student_master_dtype: float32

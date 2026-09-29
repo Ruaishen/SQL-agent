@@ -1,0 +1,1 @@
+"""Pinned third-party adapters."""

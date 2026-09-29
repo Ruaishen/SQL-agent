@@ -1,0 +1,4 @@
+The hardness calculation in hardness.py is adapted from taoyds/spider
+evaluation.py at commit b7b5b8c890cd30e35427348bb9eb8c6d1350ca7c.
+Upstream: https://github.com/taoyds/spider
+License: Apache License 2.0
