@@ -64,6 +64,7 @@ class RolloutEpisode:
     success: bool = False
     valid_actions: int = 0
     total_actions: int = 0
+    origin: str = "on_policy"
 
     def validate(self, *, require_teacher: bool = False) -> None:
         if not self.turns:
@@ -124,7 +125,7 @@ def rollout_task(
                         do_sample=True,
                         temperature=grpo_config.temperature,
                         top_p=grpo_config.top_p,
-                        top_k=grpo_config.top_k,
+                        top_k=0 if grpo_config.top_k is None else grpo_config.top_k,
                         max_new_tokens=grpo_config.max_action_tokens,
                         pad_token_id=tokenizer.eos_token_id,
                     )
@@ -189,15 +190,20 @@ def _collate_turns(turns: list[RolloutTurn], pad_token_id: int, device: str):
     return input_ids.to(device), attention_mask.to(device), action_mask.to(device)
 
 
-def collate_training_turns(turns: list[RolloutTurn], pad_token_id: int, device: str):
+def collate_training_turns(
+    turns: list[RolloutTurn], pad_token_id: int, device: str, *, require_teacher: bool = True
+):
     input_ids, attention_mask, action_mask = _collate_turns(turns, pad_token_id, device)
     old_log_probs = torch.zeros_like(action_mask, dtype=torch.float32)
-    teacher_log_probs = torch.zeros_like(action_mask, dtype=torch.float32)
+    teacher_log_probs = (
+        torch.zeros_like(action_mask, dtype=torch.float32) if require_teacher else None
+    )
     for index, turn in enumerate(turns):
-        turn.validate(require_teacher=True)
+        turn.validate(require_teacher=require_teacher)
         length = turn.input_ids.numel() - 1
         old_log_probs[index, :length] = turn.old_log_probs.to(device)
-        teacher_log_probs[index, :length] = turn.teacher_log_probs.to(device)
+        if require_teacher:
+            teacher_log_probs[index, :length] = turn.teacher_log_probs.to(device)
     return input_ids, attention_mask, action_mask, old_log_probs, teacher_log_probs
 
 

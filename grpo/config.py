@@ -23,6 +23,9 @@ class GrpoConfig:
     max_steps: int = 32
     prompts_per_step: int = 8
     rollouts_per_prompt: int = 4
+    interaction_protocol: str = "legacy"
+    gold_injection: bool = False
+    gold_injection_max_attempts: int = 3
     homogeneous_resampling_max_rollouts: int = 0
     easy_tasks: int = 0
     medium_tasks: int = 64
@@ -38,8 +41,9 @@ class GrpoConfig:
     max_action_tokens: int = 384
     temperature: float = 0.7
     top_p: float = 0.95
-    top_k: int = 20
+    top_k: int | None = 20
     clip_ratio: float = 0.2
+    clip_ratio_high: float | None = None
     kl_beta: float = 0.001
     learning_rate: float = 5e-7
     gradient_clip_norm: float = 1.0
@@ -113,6 +117,16 @@ class GrpoConfig:
                 raise ValueError("GRPO counts must be positive")
         if self.rollouts_per_prompt < 2:
             raise ValueError("GRPO requires at least two rollouts per prompt")
+        if self.interaction_protocol not in {"legacy", "reasoning_tool"}:
+            raise ValueError("unsupported GRPO interaction protocol")
+        if self.gold_injection and (
+            self.interaction_protocol != "reasoning_tool" or self.reward_mode != "binary_execution"
+        ):
+            raise ValueError("gold injection requires reasoning_tool and binary_execution")
+        if self.gold_injection and self.homogeneous_resampling_max_rollouts:
+            raise ValueError("gold injection requires fixed on-policy group size")
+        if self.gold_injection_max_attempts < 1:
+            raise ValueError("gold_injection_max_attempts must be positive")
         if self.homogeneous_resampling_max_rollouts:
             if self.reward_mode != "binary_execution":
                 raise ValueError("homogeneous resampling requires binary execution reward")
@@ -147,9 +161,18 @@ class GrpoConfig:
                 raise ValueError("curriculum source/difficulty quotas do not match task counts")
         if self.max_action_tokens >= self.max_sequence_tokens:
             raise ValueError("max_action_tokens must be below max_sequence_tokens")
-        if self.temperature <= 0 or not 0 < self.top_p <= 1:
+        if self.temperature <= 0 or not 0 < self.top_p <= 1 or (
+            self.top_k is not None and self.top_k < 0
+        ):
             raise ValueError("invalid rollout sampling parameters")
-        if not 0 <= self.clip_ratio < 1 or self.kl_beta < 0:
+        if (
+            not 0 <= self.clip_ratio < 1
+            or (
+                self.clip_ratio_high is not None
+                and not self.clip_ratio <= self.clip_ratio_high < 1
+            )
+            or self.kl_beta < 0
+        ):
             raise ValueError("invalid GRPO clip/KL parameters")
         if self.learning_rate <= 0 or self.gradient_clip_norm <= 0:
             raise ValueError("optimizer parameters must be positive")

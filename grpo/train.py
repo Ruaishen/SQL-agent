@@ -32,6 +32,7 @@ from grpo.rollout import (
     score_turns_with_teacher,
 )
 from grpo.scoring import causal_selected_log_probs
+from grpo.tagged_rollout import rollout_tagged_task
 from sql_agent.config import EnvConfig
 from sql_agent.models import TaskRecord
 
@@ -82,11 +83,14 @@ def collect_groups(
     reward_details: list[dict[str, Any]] = []
     group_sizes: list[int] = []
     for task in tasks:
+        if config.interaction_protocol == "reasoning_tool" and task.split != "train":
+            raise ValueError("reasoning_tool GRPO requires training split tasks")
         turn_limit = config.assistant_turn_limit(task.difficulty)
         task_env_config = replace(env_config, max_turns=turn_limit)
         task_rollout_config = replace(config, max_assistant_turns=turn_limit)
+        rollout_fn = rollout_tagged_task if config.interaction_protocol == "reasoning_tool" else rollout_task
         task_episodes = [
-            rollout_task(
+            rollout_fn(
                 student,
                 tokenizer,
                 task,
@@ -102,7 +106,7 @@ def collect_groups(
                 episode.success == initial_success for episode in task_episodes
             ):
                 task_episodes.append(
-                    rollout_task(
+                    rollout_fn(
                         student,
                         tokenizer,
                         task,
@@ -111,6 +115,19 @@ def collect_groups(
                         rollout_index=len(task_episodes),
                     )
                 )
+        original_successes = sum(episode.success for episode in task_episodes)
+        injection_attempts = 0
+        if config.gold_injection and original_successes == 0:
+            for attempt in range(config.gold_injection_max_attempts):
+                injection_attempts += 1
+                guided = rollout_tagged_task(
+                    student, tokenizer, task, task_env_config, task_rollout_config,
+                    rollout_index=len(task_episodes) + attempt,
+                    gold_guided=True,
+                )
+                if guided.success and guided.submitted and guided.turns:
+                    task_episodes.append(guided)
+                    break
         group_sizes.append(len(task_episodes))
         episodes.extend(task_episodes)
         execution_rewards = [float(episode.success) for episode in task_episodes]
@@ -187,6 +204,10 @@ def collect_groups(
             for index, reward in enumerate(execution_rewards):
                 reward_details.append(
                     {
+                        "trajectory_origin": task_episodes[index].origin,
+                        "original_student_correct_count": original_successes,
+                        "gold_injection_attempts": injection_attempts,
+                        "gold_injection_succeeded": len(task_episodes) > config.rollouts_per_prompt and task_episodes[-1].origin == "gold_guided",
                         "raw_execution_reward": reward,
                         "execution_advantage": group.advantages[index],
                         "schema_rank_advantage": 0.0,
@@ -218,6 +239,34 @@ def _training_records(
     return records
 
 
+def _episode_weights(group_sizes: list[int], *, group_equal: bool) -> list[float]:
+    if not group_sizes or any(size < 1 for size in group_sizes):
+        raise ValueError("GRPO group sizes must be positive")
+    if group_equal:
+        return [1.0 / (len(group_sizes) * size) for size in group_sizes for _ in range(size)]
+    episode_count = sum(group_sizes)
+    return [1.0 / episode_count] * episode_count
+
+
+def _policy_clip_counts(output, action_mask, advantages, origins: list[str]) -> dict[str, dict[str, int]]:
+    if len(origins) != action_mask.shape[0]:
+        raise ValueError("clip origins must align with training turns")
+    eligible = action_mask & advantages[:, None].ne(0)
+    clipped = output.policy_clipped.bool() & eligible
+    outside = output.clipped.bool() & action_mask
+    result: dict[str, dict[str, int]] = {}
+    for origin in set(origins):
+        selected = torch.tensor(
+            [value == origin for value in origins], device=action_mask.device
+        )[:, None]
+        values = torch.stack((
+            (clipped & selected).sum(), (eligible & selected).sum(),
+            (outside & selected).sum(), (action_mask & selected).sum(),
+        )).tolist()
+        result[origin] = dict(zip(("clipped", "eligible", "outside", "tokens"), values, strict=True))
+    return result
+
+
 def _update_once(
     student,
     tokenizer,
@@ -233,9 +282,15 @@ def _update_once(
         groups,
         group_sizes,
     )
-    episode_count = len(episodes)
+    group_equal = config.interaction_protocol == "reasoning_tool"
+    episode_weights = _episode_weights(group_sizes, group_equal=group_equal)
+    record_weights = [weight for episode, weight in zip(episodes, episode_weights, strict=True)
+                      for _ in episode.turns]
     optimizer.zero_grad(set_to_none=True)
     totals = {"loss": 0.0, "policy_loss": 0.0, "kl": 0.0, "ratio": 0.0, "clip": 0.0}
+    clip_counts = {origin: {"clipped": 0, "eligible": 0, "outside": 0, "tokens": 0}
+                   for origin in ("on_policy", "gold_guided")}
+    record_origins = [episode.origin for episode in episodes for _ in episode.turns]
     student.train()
     student.config.use_cache = False
     if config.gradient_checkpointing:
@@ -244,7 +299,9 @@ def _update_once(
         chunk = records[start : start + micro_batch_size]
         turns = [record[0] for record in chunk]
         input_ids, attention_mask, action_mask, old_log_probs, reference_log_probs = (
-            collate_training_turns(turns, tokenizer.pad_token_id, "cuda")
+            collate_training_turns(
+                turns, tokenizer.pad_token_id, "cuda", require_teacher=config.kl_beta > 0
+            )
         )
         advantages = torch.tensor(
             [record[1] for record in chunk], dtype=torch.float32, device="cuda"
@@ -252,8 +309,8 @@ def _update_once(
         token_weights = torch.zeros_like(old_log_probs)
         for index, (_, _, episode_tokens) in enumerate(chunk):
             token_weights[index] = action_mask[index].to(torch.float32) / (
-                episode_count * episode_tokens
-            )
+                episode_tokens
+            ) * record_weights[start + index]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = student(
                 input_ids=input_ids, attention_mask=attention_mask, use_cache=False
@@ -266,6 +323,7 @@ def _update_once(
                 advantages,
                 action_mask,
                 clip_ratio=config.clip_ratio,
+                clip_ratio_high=config.clip_ratio_high,
                 kl_beta=config.kl_beta,
             )
             loss = (output.token_loss * token_weights).sum()
@@ -275,6 +333,13 @@ def _update_once(
         totals["kl"] += float((output.kl * token_weights).sum().detach().cpu())
         totals["ratio"] += float((output.ratio * token_weights).sum().detach().cpu())
         totals["clip"] += float((output.clipped * token_weights).sum().detach().cpu())
+        with torch.no_grad():
+            for origin, values in _policy_clip_counts(
+                output, action_mask, advantages, record_origins[start : start + len(chunk)]
+            ).items():
+                counts = clip_counts[origin]
+                for key, value in values.items():
+                    counts[key] += value
         del (
             logits,
             current_log_probs,
@@ -297,6 +362,19 @@ def _update_once(
     grad_value = float(grad_norm.detach().cpu())
     return {
         **totals,
+        "policy_clip_fraction": sum(value["clipped"] for value in clip_counts.values())
+        / max(1, sum(value["eligible"] for value in clip_counts.values())),
+        "policy_clip_eligible_tokens": sum(value["eligible"] for value in clip_counts.values()),
+        **{
+            f"{origin}_{key}": value
+            for origin, counts in clip_counts.items()
+            for key, value in {
+                "policy_clip_fraction": counts["clipped"] / max(1, counts["eligible"]),
+                "policy_clip_tokens": counts["clipped"],
+                "policy_clip_eligible_tokens": counts["eligible"],
+                "ratio_outside_fraction": counts["outside"] / max(1, counts["tokens"]),
+            }.items()
+        },
         "turns": len(records),
         "action_tokens": sum(
             int(turn.action_mask.sum()) for episode in episodes for turn in episode.turns
@@ -305,7 +383,7 @@ def _update_once(
         "gradient_clip_norm": config.gradient_clip_norm,
         "gradient_clip_scale": min(1.0, config.gradient_clip_norm / (grad_value + 1e-12)),
         "update_micro_batch_size": micro_batch_size,
-        "loss_normalization": "episode_equal",
+        "loss_normalization": "group_equal_episode_equal" if group_equal else "episode_equal",
     }
 
 
@@ -373,6 +451,7 @@ def _save_episodes(
                 "advantage": groups[group_index].advantages[rollout_index],
                 "group_kind": groups[group_index].kind,
                 "group_size": group_sizes[group_index],
+                "trajectory_origin": episode.origin,
                 "selection_source": task_metadata[group_index]["selection_source"],
                 "prior_correct_count": task_metadata[group_index]["prior_correct_count"],
                 **details,
@@ -471,10 +550,16 @@ def _curriculum_metrics(
     prior_rollouts_per_prompt: int,
 ) -> dict[str, Any]:
     current_counts: Counter[str] = Counter()
+    original_counts: Counter[str] = Counter()
     transitions: Counter[str] = Counter()
     start = 0
     for group_index, group_size in enumerate(group_sizes):
         current = sum(episode.success for episode in episodes[start : start + group_size])
+        original = sum(
+            episode.success for episode in episodes[start : start + group_size]
+            if episode.origin == "on_policy"
+        )
+        original_counts[f"{original}/{prior_rollouts_per_prompt}"] += 1
         start += group_size
         current_label = f"{current}/{group_size}"
         prior_count = task_metadata[group_index].get("prior_correct_count")
@@ -485,6 +570,7 @@ def _curriculum_metrics(
         transitions[f"{prior_label}->{current_label}"] += 1
     return {
         "current_correct_count_histogram": dict(sorted(current_counts.items())),
+        "original_student_correct_count_histogram": dict(sorted(original_counts.items())),
         "prior_to_current_transitions": dict(sorted(transitions.items())),
     }
 
@@ -579,11 +665,12 @@ def main() -> None:
         student_initialization, dtype=torch.float32, device_map={"": "cuda:0"}
     )
     student.requires_grad_(True)
-    reference = AutoModelForCausalLM.from_pretrained(
-        config.reference_model, dtype=torch.bfloat16, device_map={"": "cuda:0"}
-    )
-    reference.requires_grad_(False)
-    reference.eval()
+    if config.kl_beta > 0:
+        reference = AutoModelForCausalLM.from_pretrained(
+            config.reference_model, dtype=torch.bfloat16, device_map={"": "cuda:0"}
+        )
+        reference.requires_grad_(False)
+        reference.eval()
     optimizer = torch.optim.AdamW(
         student.parameters(),
         lr=config.learning_rate,
@@ -607,12 +694,13 @@ def main() -> None:
             config,
             schema_rewarder,
         )
-        score_turns_with_teacher(
-            reference,
-            tokenizer,
-            episodes,
-            micro_batch_size=config.reference_score_micro_batch_size,
-        )
+        if config.kl_beta > 0:
+            score_turns_with_teacher(
+                reference,
+                tokenizer,
+                episodes,
+                micro_batch_size=config.reference_score_micro_batch_size,
+            )
         step_dir = config.output_dir / f"step_{step:04d}"
         _save_episodes(
             episodes,
@@ -654,6 +742,20 @@ def main() -> None:
             **group_metrics,
             **curriculum_metrics,
             **_resampling_metrics(groups, group_sizes, config.rollouts_per_prompt),
+            "original_student_success_rate": sum(
+                episode.success for episode in episodes if episode.origin == "on_policy"
+            ) / max(1, sum(episode.origin == "on_policy" for episode in episodes)),
+            "gold_injected_groups": sum(
+                episode.origin == "gold_guided" for episode in episodes
+            ),
+            "gold_injection_attempts": sum(
+                detail.get("gold_injection_attempts", 0)
+                for detail in reward_details if detail.get("trajectory_origin") == "on_policy"
+            ) / config.rollouts_per_prompt if config.gold_injection else 0,
+            "original_all_zero_groups": sum(
+                detail.get("original_student_correct_count") == 0
+                for detail in reward_details if detail.get("trajectory_origin") == "on_policy"
+            ) / config.rollouts_per_prompt if config.interaction_protocol == "reasoning_tool" else None,
             **_schema_metrics(reward_details, groups, config.rollouts_per_prompt),
             **update,
             "peak_gpu_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
@@ -720,6 +822,8 @@ def main() -> None:
         "schema_multi_table_weights": config.schema_multi_table_weights,
         "execute_sql_schema_factor": config.execute_sql_schema_factor,
         "homogeneous_resampling_max_rollouts": config.homogeneous_resampling_max_rollouts,
+        "interaction_protocol": config.interaction_protocol,
+        "gold_injection": config.gold_injection,
         "student_update": "full",
         "formal_training": True,
         "turn_reward_step": config.turn_reward_step,
