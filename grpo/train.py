@@ -116,18 +116,6 @@ def collect_groups(
                     )
                 )
         original_successes = sum(episode.success for episode in task_episodes)
-        injection_attempts = 0
-        if config.gold_injection and original_successes == 0:
-            for attempt in range(config.gold_injection_max_attempts):
-                injection_attempts += 1
-                guided = rollout_tagged_task(
-                    student, tokenizer, task, task_env_config, task_rollout_config,
-                    rollout_index=len(task_episodes) + attempt,
-                    gold_guided=True,
-                )
-                if guided.success and guided.submitted and guided.turns:
-                    task_episodes.append(guided)
-                    break
         group_sizes.append(len(task_episodes))
         episodes.extend(task_episodes)
         execution_rewards = [float(episode.success) for episode in task_episodes]
@@ -206,8 +194,6 @@ def collect_groups(
                     {
                         "trajectory_origin": task_episodes[index].origin,
                         "original_student_correct_count": original_successes,
-                        "gold_injection_attempts": injection_attempts,
-                        "gold_injection_succeeded": len(task_episodes) > config.rollouts_per_prompt and task_episodes[-1].origin == "gold_guided",
                         "raw_execution_reward": reward,
                         "execution_advantage": group.advantages[index],
                         "schema_rank_advantage": 0.0,
@@ -289,7 +275,7 @@ def _update_once(
     optimizer.zero_grad(set_to_none=True)
     totals = {"loss": 0.0, "policy_loss": 0.0, "kl": 0.0, "ratio": 0.0, "clip": 0.0}
     clip_counts = {origin: {"clipped": 0, "eligible": 0, "outside": 0, "tokens": 0}
-                   for origin in ("on_policy", "gold_guided")}
+                   for origin in ("on_policy",)}
     record_origins = [episode.origin for episode in episodes for _ in episode.turns]
     student.train()
     student.config.use_cache = False
@@ -745,13 +731,6 @@ def main() -> None:
             "original_student_success_rate": sum(
                 episode.success for episode in episodes if episode.origin == "on_policy"
             ) / max(1, sum(episode.origin == "on_policy" for episode in episodes)),
-            "gold_injected_groups": sum(
-                episode.origin == "gold_guided" for episode in episodes
-            ),
-            "gold_injection_attempts": sum(
-                detail.get("gold_injection_attempts", 0)
-                for detail in reward_details if detail.get("trajectory_origin") == "on_policy"
-            ) / config.rollouts_per_prompt if config.gold_injection else 0,
             "original_all_zero_groups": sum(
                 detail.get("original_student_correct_count") == 0
                 for detail in reward_details if detail.get("trajectory_origin") == "on_policy"

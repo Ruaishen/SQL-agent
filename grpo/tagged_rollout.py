@@ -1,4 +1,4 @@
-"""On-policy and conditional Gold-guided rollouts for the Spider CoT protocol."""
+"""On-policy rollouts for binary execution GRPO with the Spider CoT protocol."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from sql_agent.env import SQLAgentEnv
 from sql_agent.models import TaskRecord
 from sql_agent.truncation import canonical_json
 from sql_planner.collect_tagged import build_prompt, parse_response
-from sql_planner.repair_tagged import GOLD_MENTION, _hint, teacher_prompt
 
 
 class _OneToolStop(StoppingCriteria):
@@ -41,12 +40,8 @@ def rollout_tagged_task(
     *,
     device: str = "cuda",
     rollout_index: int = 0,
-    gold_guided: bool = False,
 ) -> RolloutEpisode:
-    """Generate with an optional Gold hint, always score under the hint-free policy.
-
-    The returned tensors and logged transcript never include the private hint.
-    """
+    """Sample and score assistant actions under the same ordinary policy context."""
     if task.split != "train":
         raise ValueError("GRPO rollouts require a training task")
     clean_system = build_prompt(env_config.max_turns)
@@ -54,38 +49,18 @@ def rollout_tagged_task(
         env_config, reserve_final_submission=True, system_prompt=clean_system
     )
     episode = RolloutEpisode(task.task_id, task.db_id, task.difficulty)
-    episode.origin = "gold_guided" if gold_guided else "on_policy"
     clean_messages: list[dict[str, str]] = [
         {"role": "system", "content": clean_system},
         {"role": "user", "content": task.question},
     ]
-    generation_messages = (
-        [
-            {"role": "system", "content": teacher_prompt(env_config.max_turns)},
-            {"role": "user", "content": task.question},
-            {"role": "user", "content": _hint(task.reference_sql)},
-        ]
-        if gold_guided
-        else clean_messages
-    )
     special_ids = set(tokenizer.all_special_ids)
     task_seed = int.from_bytes(hashlib.sha256(task.task_id.encode()).digest()[:4], "big")
-    listed_tables = False
-    inspected_schema = False
-    tested_sql: str | None = None
     try:
         env.reset(task)
-        if gold_guided:
-            gold_check = env.verify(task.reference_sql)
-            if not (gold_check.agent_sql_valid and gold_check.agent_sql_executable and gold_check.correct):
-                return episode
         while not env.done and len(episode.turns) <= config.max_assistant_turns:
             clean_ids = _prompt_ids(tokenizer, clean_messages, device)
-            generation_ids = _prompt_ids(tokenizer, generation_messages, device)
-            if max(clean_ids.shape[1], generation_ids.shape[1]) + config.max_action_tokens > config.max_sequence_tokens:
+            if clean_ids.shape[1] + config.max_action_tokens > config.max_sequence_tokens:
                 if not episode.turns:
-                    if gold_guided:
-                        return episode
                     raise ValueError(f"task {task.task_id} prompt exceeds GRPO sequence budget")
                 break
             generation_seed = (
@@ -98,8 +73,8 @@ def rollout_tagged_task(
                     torch.cuda.manual_seed_all(generation_seed)
                 with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
                     generated = model.generate(
-                        input_ids=generation_ids,
-                        attention_mask=torch.ones_like(generation_ids),
+                        input_ids=clean_ids,
+                        attention_mask=torch.ones_like(clean_ids),
                         do_sample=True,
                         temperature=config.temperature,
                         top_p=config.top_p,
@@ -108,8 +83,8 @@ def rollout_tagged_task(
                         pad_token_id=tokenizer.eos_token_id,
                         stopping_criteria=StoppingCriteriaList([_OneToolStop(tokenizer)]),
                     )
-            continuation = generated[0, generation_ids.shape[1]:]
-            sequence = torch.cat((clean_ids[0], continuation)).unsqueeze(0)
+            continuation = generated[0, clean_ids.shape[1]:]
+            sequence = generated
             prompt_length = clean_ids.shape[1]
             with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
                 logits = model(input_ids=sequence, attention_mask=torch.ones_like(sequence), use_cache=False).logits
@@ -123,9 +98,7 @@ def rollout_tagged_task(
             response = tokenizer.decode(continuation, skip_special_tokens=True).strip()
             episode.total_actions += 1
             try:
-                reasoning, action = parse_response(response)
-                if gold_guided and GOLD_MENTION.search(reasoning):
-                    raise ValueError("reasoning reveals the Gold hint")
+                _, action = parse_response(response)
                 if env.turn >= env_config.max_turns and action["tool"] != "submit_sql":
                     raise ValueError("exploration budget exhausted")
                 episode.valid_actions += 1
@@ -133,20 +106,8 @@ def rollout_tagged_task(
                     observation, _ = env.submit_sql(action["arguments"])
                     episode.submitted = "verification" in observation
                     episode.success = bool(observation.get("verification", {}).get("correct", False))
-                    if gold_guided:
-                        episode.success = episode.success and (
-                            listed_tables and inspected_schema
-                            and tested_sql == action["arguments"].get("sql")
-                        )
                 else:
                     observation, _ = env.step(action)
-                    if observation.get("status") == "success":
-                        if action["tool"] == "list_tables":
-                            listed_tables = True
-                        elif action["tool"] == "inspect_tables":
-                            inspected_schema = True
-                        elif action["tool"] == "execute_sql":
-                            tested_sql = action["arguments"].get("sql")
             except ValueError as exc:
                 observation = {"status": "invalid_format", "message": str(exc)}
                 episode.turns.append(RolloutTurn(
@@ -170,8 +131,6 @@ def rollout_tagged_task(
                 "role": "user", "content": f"<observation>{canonical_json(observation)}</observation>"
             }
             clean_messages.extend(({"role": "assistant", "content": response}, observation_message))
-            if gold_guided:
-                generation_messages.extend(({"role": "assistant", "content": response}, observation_message))
         if episode.turns:
             episode.validate()
         return episode

@@ -17,12 +17,12 @@ from sql_agent.config import EnvConfig
 from sql_agent.models import TaskRecord
 
 
-def _config(tmp_path: Path, *, inject: bool) -> GrpoConfig:
+def _config(tmp_path: Path) -> GrpoConfig:
     return GrpoConfig(
         student_model=tmp_path, reference_model=tmp_path,
         train_data=tmp_path, output_dir=tmp_path,
-        rollouts_per_prompt=4, medium_tasks=1,
-        interaction_protocol="reasoning_tool", gold_injection=inject,
+        rollouts_per_prompt=6, medium_tasks=1,
+        interaction_protocol="reasoning_tool",
     )
 
 
@@ -35,68 +35,44 @@ def _task() -> TaskRecord:
 
 
 @pytest.mark.parametrize(
-    ("successes", "inject", "expected_size", "expected_guided", "expected_kind"),
+    ("successes", "expected_kind"),
     [
-        (set(), True, 5, 1, "mixed"),
-        ({0, 2}, True, 4, 0, "mixed"),
-        ({0, 1, 2, 3}, True, 4, 0, "all_one"),
-        (set(), False, 4, 0, "all_zero"),
+        (set(), "all_zero"),
+        ({0, 2}, "mixed"),
+        (set(range(6)), "all_one"),
     ],
 )
-def test_conditional_gold_injection_only_on_all_wrong(
-    monkeypatch, tmp_path, successes, inject, expected_size, expected_guided, expected_kind
+def test_binary_grpo_keeps_six_on_policy_rollouts(
+    monkeypatch, tmp_path, successes, expected_kind
 ):
     calls = []
 
-    def fake_rollout(model, tokenizer, task, env, config, *, rollout_index, gold_guided=False):
-        calls.append(gold_guided)
+    def fake_rollout(model, tokenizer, task, env, config, *, rollout_index):
+        calls.append(rollout_index)
         episode = RolloutEpisode(task.task_id, task.db_id, task.difficulty)
-        episode.origin = "gold_guided" if gold_guided else "on_policy"
-        episode.success = gold_guided or rollout_index in successes
+        episode.success = rollout_index in successes
         episode.submitted = True
-        if gold_guided:
-            episode.turns = [object()]
         return episode
 
     monkeypatch.setattr("grpo.train.rollout_tagged_task", fake_rollout)
     episodes, groups, details, sizes = collect_groups(
-        None, None, [_task()], EnvConfig(), _config(tmp_path, inject=inject)
+        None, None, [_task()], EnvConfig(), _config(tmp_path)
     )
-    assert sizes == [expected_size]
+    assert sizes == [6]
     assert groups[0].kind == expected_kind
-    assert len(episodes) == len(details) == expected_size
-    assert sum(calls) == expected_guided
-    if expected_guided:
-        assert groups[0].advantages[-1] > 0
-        assert all(value < 0 for value in groups[0].advantages[:-1])
-        assert details[-1]["trajectory_origin"] == "gold_guided"
-
-
-def test_three_failed_gold_attempts_leave_all_zero_group(monkeypatch, tmp_path):
-    calls = []
-
-    def fake_rollout(model, tokenizer, task, env, config, *, rollout_index, gold_guided=False):
-        calls.append(gold_guided)
-        episode = RolloutEpisode(task.task_id, task.db_id, task.difficulty)
-        episode.origin = "gold_guided" if gold_guided else "on_policy"
-        episode.success = False
-        episode.submitted = gold_guided
-        return episode
-
-    monkeypatch.setattr("grpo.train.rollout_tagged_task", fake_rollout)
-    config = _config(tmp_path, inject=True)
-    assert config.gold_injection_max_attempts == 3
-    episodes, groups, details, sizes = collect_groups(
-        None, None, [_task()], EnvConfig(), config
-    )
-
-    assert calls == [False] * 4 + [True] * 3
-    assert sizes == [4]
-    assert len(episodes) == len(details) == 4
-    assert groups[0].kind == "all_zero"
-    assert groups[0].advantages == (0.0,) * 4
-    assert all(detail["gold_injection_attempts"] == 3 for detail in details)
-    assert all(not detail["gold_injection_succeeded"] for detail in details)
+    assert len(episodes) == len(details) == 6
+    assert calls == list(range(6))
+    assert all(episode.origin == "on_policy" for episode in episodes)
+    assert [detail["raw_execution_reward"] for detail in details] == [
+        float(index in successes) for index in range(6)
+    ]
+    if not successes or len(successes) == 6:
+        assert groups[0].advantages == (0.0,) * 6
+    else:
+        assert all(
+            (advantage > 0) == (index in successes)
+            for index, advantage in enumerate(groups[0].advantages)
+        )
 
 
 def test_policy_clip_counts_only_advantage_constrained_side():
@@ -110,10 +86,9 @@ def test_policy_clip_counts_only_advantage_constrained_side():
     assert output.policy_clipped.tolist() == [[1.0, 0.0], [0.0, 1.0]]
     counts = _policy_clip_counts(
         output, torch.ones_like(current, dtype=torch.bool),
-        torch.tensor([1.0, -1.0]), ["on_policy", "gold_guided"]
+        torch.tensor([1.0, -1.0]), ["on_policy", "on_policy"]
     )
-    assert counts["on_policy"] == {"clipped": 1, "eligible": 2, "outside": 2, "tokens": 2}
-    assert counts["gold_guided"] == {"clipped": 1, "eligible": 2, "outside": 2, "tokens": 2}
+    assert counts["on_policy"] == {"clipped": 2, "eligible": 4, "outside": 4, "tokens": 4}
     output.policy_loss.sum().backward()
     assert current.grad[0, 0] == current.grad[1, 1] == 0
     assert current.grad[0, 1] != 0 and current.grad[1, 0] != 0
@@ -153,10 +128,10 @@ def test_zero_kl_collates_turns_without_reference_scores():
     assert reference is None
 
 
-def test_injected_group_keeps_same_total_weight_as_standard_group():
-    weights = _episode_weights([4, 5], group_equal=True)
-    assert sum(weights[:4]) == pytest.approx(0.5)
-    assert sum(weights[4:]) == pytest.approx(0.5)
+def test_each_six_rollout_group_has_equal_total_weight():
+    weights = _episode_weights([6, 6], group_equal=True)
+    assert sum(weights[:6]) == pytest.approx(0.5)
+    assert sum(weights[6:]) == pytest.approx(0.5)
 
 
 def test_generation_stops_after_first_tool_block():
@@ -166,8 +141,8 @@ def test_generation_stops_after_first_tool_block():
     assert stopping(torch.tensor([[ord(char) for char in "<tool>x</tool>"]]), None)
 
 
-def test_gold_injection_requires_tagged_binary_fixed_group(tmp_path):
-    with pytest.raises(ValueError, match="requires reasoning_tool"):
+def test_gold_injection_is_rejected_even_for_old_configs(tmp_path):
+    with pytest.raises(ValueError, match="no longer supported"):
         GrpoConfig(
             student_model=tmp_path, reference_model=tmp_path,
             train_data=tmp_path, output_dir=tmp_path,
@@ -175,7 +150,7 @@ def test_gold_injection_requires_tagged_binary_fixed_group(tmp_path):
         ).validate()
 
 
-def test_guided_rollout_is_rescored_without_gold_hint(monkeypatch, tmp_path):
+def test_rollout_generation_and_scoring_never_receive_gold_hint(monkeypatch, tmp_path):
     class Tokenizer:
         all_special_ids = [0]
         eos_token_id = 0
@@ -191,6 +166,7 @@ def test_guided_rollout_is_rescored_without_gold_hint(monkeypatch, tmp_path):
         def __init__(self):
             self.generation_prompts = []
             self.sampling_options = []
+            self.scoring_inputs = []
 
         def eval(self):
             return self
@@ -213,6 +189,7 @@ def test_guided_rollout_is_rescored_without_gold_hint(monkeypatch, tmp_path):
             return torch.cat((input_ids, tokens), dim=1)
 
         def __call__(self, *, input_ids, **kwargs):
+            self.scoring_inputs.append(input_ids.clone())
             return SimpleNamespace(logits=torch.zeros(
                 input_ids.shape[0], input_ids.shape[1], 258
             ))
@@ -224,10 +201,6 @@ def test_guided_rollout_is_rescored_without_gold_hint(monkeypatch, tmp_path):
 
         def reset(self, task):
             return {}
-
-        def verify(self, sql):
-            assert sql == "SELECT 123"
-            return SimpleNamespace(agent_sql_valid=True, agent_sql_executable=True, correct=True)
 
         def submit_sql(self, arguments):
             assert arguments == {"sql": "SELECT 123"}
@@ -245,21 +218,26 @@ def test_guided_rollout_is_rescored_without_gold_hint(monkeypatch, tmp_path):
     tokenizer = Tokenizer()
     model = Model()
     task = TaskRecord(
-        task_id="guided", source="test", db_id="db", db_path="db.sqlite",
-        question="How many?", reference_sql="SELECT 123",
+        task_id="ordinary", source="test", db_id="db", db_path="db.sqlite",
+        question="How many?", reference_sql="SELECT 987654",
         difficulty="medium", split="train",
     )
     config = replace(
-        _config(tmp_path, inject=True),
+        _config(tmp_path),
         top_k=None, temperature=1.0, top_p=0.99,
         clip_ratio_high=0.28, kl_beta=0.0, learning_rate=1e-6,
     )
     episode = rollout_tagged_task(
         model, tokenizer, task, EnvConfig(max_turns=3), config,
-        device="cpu", gold_guided=True,
+        device="cpu",
     )
-    assert episode.success and episode.origin == "gold_guided"
-    assert "SELECT 123" in model.generation_prompts[0]
+    assert episode.success and episode.origin == "on_policy"
+    assert all("SELECT 987654" not in prompt for prompt in model.generation_prompts)
+    assert all("Training-only target SQL" not in prompt for prompt in model.generation_prompts)
+    assert all(
+        torch.equal(turn.input_ids, ids[0])
+        for turn, ids in zip(episode.turns, model.scoring_inputs, strict=True)
+    )
     assert model.sampling_options[0]["top_k"] == 0
     assert model.sampling_options[0]["temperature"] == 1.0
     assert model.sampling_options[0]["top_p"] == 0.99

@@ -119,12 +119,8 @@ class GrpoConfig:
             raise ValueError("GRPO requires at least two rollouts per prompt")
         if self.interaction_protocol not in {"legacy", "reasoning_tool"}:
             raise ValueError("unsupported GRPO interaction protocol")
-        if self.gold_injection and (
-            self.interaction_protocol != "reasoning_tool" or self.reward_mode != "binary_execution"
-        ):
-            raise ValueError("gold injection requires reasoning_tool and binary_execution")
-        if self.gold_injection and self.homogeneous_resampling_max_rollouts:
-            raise ValueError("gold injection requires fixed on-policy group size")
+        if self.gold_injection:
+            raise ValueError("gold injection is no longer supported; use binary_execution GRPO")
         if self.gold_injection_max_attempts < 1:
             raise ValueError("gold_injection_max_attempts must be positive")
         if self.homogeneous_resampling_max_rollouts:
