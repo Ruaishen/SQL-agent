@@ -1,6 +1,6 @@
 # SQL Agent RL
 
-基于 Spider 1.0 的多轮 Text-to-SQL 项目。项目保留两条训练路径：成功轨迹 SFT 和 Binary GRPO；`sql_agent/` 提供共同的只读 SQLite 环境与执行验证器，`evaluation/` 提供重新评测所需的代码。
+基于 Spider 1.0 的多轮 Text-to-SQL 项目。项目支持成功轨迹 SFT、偏好轨迹 DPO 和 Binary GRPO；`sql_agent/` 提供共同的只读 SQLite 环境与执行验证器，`evaluation/` 提供重新评测所需的代码。
 
 原始 Spider 数据集位于 `../datasets/spider/spider_data/`。仓库内的预处理数据、训练轨迹、检查点和历史评测记录均已清理；运行下列步骤会重新生成它们。配置中的模型路径和输出路径沿用原远程环境示例，运行前请改成实际路径。
 
@@ -103,3 +103,130 @@ python -m sql_planner.collect_spider_train \
 ```
 
 该入口不会读取 `train_others.json`，也不会向模型提供 Gold SQL。默认输出目录为 `artifacts/sql_planner/spider_train_7000_multi_table_v11/`，与旧版采集结果分开。模型可以自由选择探索工具，但每次回复只能提出一个调用；探索次数达到上限后，采集器仅提供 `submit_sql`。每条轨迹独立保存，重复运行会跳过已有文件。建议先加 `--limit 100 --workers 4` 做小规模连通性与费用检查，再运行全部 7,000 条。
+
+## DPO：数学目标与当前偏好数据构造
+
+项目的后训练顺序为 **成功轨迹 SFT → DPO → Binary GRPO**。DPO 使用同一上下文下的优选与劣选续写，让 Qwen2.5-Coder-3B 的 SFT 模型学习更可靠的 SQL 修复行为。当前数据属于 **Gold 引导生成、真实数据库验证、独立模型审核的合成偏好**；尚未逐条人工审核。
+
+### 1. 偏好对与训练范围
+
+每条数据记为 $(x,y_w,y_l)$：
+
+| 符号 | 在本项目中的含义 |
+| --- | --- |
+| $x$ | 共同前缀：系统提示、原问题、分叉前的助手回复与真实工具观察 |
+| $y_w$ | chosen：教师从分叉点生成、数据库验证正确且通过严格审核的修复后缀 |
+| $y_l$ | rejected：原始失败轨迹从同一分叉点开始的后缀 |
+| $\pi_\theta$ | 从 SFT 检查点初始化、接受 DPO 更新的策略模型 |
+| $\pi_{\mathrm{ref}}$ | 冻结的同一 SFT 检查点 |
+| $\beta$ | 相对参考模型的偏好分数缩放参数，当前配置为 $0.1$ |
+
+分叉后的两条分支可以产生不同的工具结果。各分支的助手回复均条件化于该分支自己的真实历史；工具观察作为上下文输入。
+
+定义本项目实际使用的分支分数：
+
+$$
+s_\theta(y\mid x)=\sum_{i=1}^{N_y}m_i\log\pi_\theta(z_i\mid x,z_{<i}),
+\qquad
+m_i=\begin{cases}
+1,& z_i\text{ 属于分叉点及之后的助手回复},\\
+0,& \text{其他位置}.
+\end{cases}
+$$
+
+这里 $z$ 是按时间顺序序列化的后缀消息。`dpo/prepare.py` 对助手回复内容及模板终止 token 建立 mask，覆盖学生可见的 `<reasoning>` 和 `<tool>` 动作；共同前缀、系统消息、用户消息和工具观察不计入分数。对于“成功执行但答案错误”的主要组，分叉前的错误 SQL 和返回观察完整保留，从**观察返回后的下一条助手回复**开始计算 loss。
+
+`dpo/train.py::branch_logp` 对 mask 内 token 的 log probability **求和**，不按长度取平均。因此后缀长度会影响分支分数，数据筛选和评估应关注长度分布。
+
+### 2. DPO 损失
+
+标准 DPO 通过策略相对参考策略的 log probability 差构造偏好分数，参见 [DPO 原论文](https://arxiv.org/abs/2305.18290)。本项目将多轮助手续写的上述分数代入该目标：
+
+$$
+\Delta_\theta(x,y_w,y_l)
+=\bigl[s_\theta(y_w\mid x)-s_\theta(y_l\mid x)\bigr]
+-\bigl[s_{\mathrm{ref}}(y_w\mid x)-s_{\mathrm{ref}}(y_l\mid x)\bigr].
+$$
+
+$$
+\mathcal L_{\mathrm{DPO}}(\theta)
+=-\mathbb E_{(x,y_w,y_l)\sim\mathcal D}
+\left[\log\sigma\left(\beta\Delta_\theta(x,y_w,y_l)\right)\right]
+=\mathbb E_{\mathcal D}\left[\operatorname{softplus}(-\beta\Delta_\theta)\right].
+$$
+
+其中 $\sigma(u)=1/(1+e^{-u})$。减小损失会提高 chosen 相对 rejected 的优势，并以冻结的 SFT 模型为基准。数据库奖励用于构造和核验偏好标签，不直接作为该损失的乘数。
+
+单对样本的梯度为：
+
+$$
+\nabla_\theta\ell
+=-\beta\sigma(-\beta\Delta_\theta)
+\left[\nabla_\theta s_\theta(y_w\mid x)-\nabla_\theta s_\theta(y_l\mid x)\right].
+$$
+
+训练实现预先缓存冻结参考模型的两条分支分数，再加载策略模型进行全参数更新；两条分支分别反向传播，以降低同时保留两份长序列计算图的显存占用。当前 `configs/dpo_reasoning_sql_success.yaml` 设置：1 epoch、有效 batch size 8、学习率 $10^{-6}$、$\beta=0.1$、梯度裁剪范数 1.0，并启用 gradient checkpointing。
+
+### 3. 失败轨迹选择与分叉
+
+来源为 `artifacts/sql_planner/reasoning/trajectories/` 的 7,000 条训练集轨迹：5,093 条正确、1,907 条失败。先在真实 Spider 数据库上检查 Gold SQL；1,904 条可构造，另 3 条因 Gold 无法执行或核验而隔离，记录 `block_reason=gold_not_executable`。原始轨迹保持不变。
+
+`dpo/pairs.py` 按下列优先级选择分叉点：
+
+1. 最后一次成功 `execute_sql`、但结果被核验为错误的观察之后：1,832 条。
+2. 若不存在上述位置，优先选择失败的 `execute_sql` 观察之后；当前选择快照中该组为 0 条。
+3. 若不存在上述位置，选择其他成功 SQL 观察之后：45 条，包含中间 SQL 正确、最终提交错误的情况。
+4. 在未测试的最终提交之前：14 条；或在导致 `invalid_format` 的错误回复之前：13 条。
+
+保存 `fork_turn`、`fork_reason`、源文件哈希和原始 rejected 后缀，核对两条分支的共同前缀一致。选择清单为 `artifacts/sql_planner/reasoning_dpo_all_errors_v1/selection.json`。
+
+### 4. 构造 chosen 修复后缀
+
+当前批次使用 `deepseek-flash`，开启 thinking，`reasoning_effort=high`。流程如下：
+
+1. 在真实工具环境中回放共同前缀，检查观察漂移。
+2. 保持普通 agent 的 system prompt；仅在教师续写请求中追加 Gold SQL 和修复要求。
+3. 教师每轮输出原始 reasoning 与一个工具动作；工具结果由真实 SQLite 环境产生，继续沿用探索预算和 `submit_sql` 协议。
+4. 要求最终提交与 Gold SQL 按实现的精确字符串规则一致，并由 `ExecutionVerifier` 执行完整结果核验；展示观察的截断不影响完整核验。
+5. 保存学生可见的原始 reasoning、动作和真实观察；教师提示和 API 内部思考不进入学生消息。当前严格批次设置 `sanitize_hint_reasoning=False`，发现提示引用时交给审核拒绝，保留证据。
+
+这些后缀由 Gold 引导生成。去掉教师提示后，仍需检查 reasoning 是否引用隐藏答案或续写指令，才能进入训练集。
+
+### 5. 独立审核与接受条件
+
+生成通过数据库核验的候选 pair 后，使用独立的 Flash high 请求进行盲审。审核员只收到学生可见的问题、共同前缀、修复后缀和机械检查结果，不收到 Gold SQL、教师提示或 API 内部思考。检查只针对分叉后的 chosen 后缀；原始 rejected 本身允许含有错误。
+
+机械检查和语义审核共同检查：共同前缀一致性、记录一致性、最终 SQL 正确性、回复格式、提示引用、编造观察、错误描述观察、问题不匹配、缺乏依据的 schema 声明，以及 reasoning 与动作的矛盾。语义审核会识别 `The continuation instructs...` 等隐藏指令引用，不局限于 `hint`、`gold` 关键词。
+
+提交前测试规则：最终提交 SQL 必须曾成功 `execute_sql`；共同前缀中的执行也可以计入。比较字符串时只去首尾空白，不规范化 SQL，因此大小写、内部空格或引号差异都可能触发 `untested_final_sql`。提交时探索预算已耗尽可例外，但仍禁止声称观察到不存在的验证结果。
+
+审核返回 `accept`、`reject` 或 `uncertain`，附问题代码、逐字证据与回合位置；程序校验输出结构及证据。**仅 accept 合并进严格数据集**。数据库结果正确仍可能因轨迹质量问题被拒绝；模型审核可能漏检，接受结果不代表已经人工逐条检查。
+
+实现与规则：`dpo/audit.py`、`docs/dpo_repair_audit_prompt.md`。
+
+### 6. 首轮、追加尝试与断点续跑
+
+首轮严格构造已完成：1,904 条可构造任务中，生成 1,885 对，19 条生成失败；审核接受 330 对、拒绝 1,555 对、uncertain 0 对。首轮完整轨迹生成最多尝试 3 次，得到数据库核验通过的 pair 后进行审核。
+
+当前追加批次覆盖此前拒绝的 1,555 条和生成失败的 19 条，共 1,574 条任务。每题**最多追加两次完整轨迹生成并审核**，首次 accept 后停止；原有 330 对原样保留，按 `task_id` 去重后合并。回合格式重试、网络重试以及已保存 pair 的审核重试单独记录，不增加完整轨迹生成名额。
+
+在 API 生成前持久化尝试记录；中断时未保存结果的生成占用本次名额，防止恢复后超过两次。已保存 pair 的审核异常只重试审核。manifest 固定源数据、原有 pair、提示和实现哈希；恢复时跳过已完成任务。
+
+| 数据目录 | 用途 |
+| --- | --- |
+| `artifacts/sql_planner/reasoning_dpo_flash_high_strict_all_20261003_v1/` | 首轮严格生成、审核及已接受的 330 对 |
+| `artifacts/sql_planner/reasoning_dpo_flash_high_strict_retry2_20261006_v1/` | 最多两次追加生成、审核、接受结果及进度 |
+| 上述目录的 `attempts/01/`、`attempts/02/` | 开始记录、生成记录、pair 和审核证据 |
+| 上述目录的 `report.json` | 当前权威计数与完成状态 |
+
+本次工作交付目录为 `C:/Users/JSWang/Documents/Codex/2026-10-03/yu/outputs/`。首轮数据为 `dpo_pairs_strict.jsonl`；追加批次运行中导出 `dpo_pairs_strict_retry2_merged.partial.jsonl`，全部处理完成且无审核异常后导出 `dpo_pairs_strict_retry2_merged.jsonl`。相关报告为 `dpo_full_generation_report.md` 和 `dpo_retry2_report.md`。
+
+进度快照（2026-10-06 19:07，北京时间；后台会继续更新，以 `report.json` 为准）：状态 `running_or_incomplete`，完成 1101/1574 条，新增接受 215 对，合并 545 对，剩余 473 条，待处理审核异常 23 条。
+
+### 7. 训练准备与当前限制
+
+训练前按任务去重；若划分训练与验证集，整道题及其所有派生轨迹进入同一 split。使用目标 SFT 检查点的 tokenizer/chat template，核对 tokenization 和分叉 mask；超出 16,384 token 的分支由当前准备入口报错，不静默截断。
+
+`dpo/train.py` 提供 `score-reference` 和 `train` 两个模式，参考模型和策略模型均从同一 SFT 检查点初始化。当前配置的路径仍指向早期 `reasoning_dpo_all_errors_v1/tokenized`；`dpo/prepare.py` 也要求全量 eligible selection 与 generation report 一致，尚不能直接读取这次审核后的合并 JSONL。实际训练前需要为最终 accept 子集生成兼容的准备清单和 tokenized shards，并更新配置路径。当前后台任务执行的是数据构造与审核，尚未启动本批次 GPU DPO 训练。
+
+评估应记录 `fork_reason`、后缀长度、数据库执行正确率和提交前验证情况，并在固定验证集上比较 SFT、DPO 和后续 GRPO 检查点。
