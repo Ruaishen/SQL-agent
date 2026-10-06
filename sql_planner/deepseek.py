@@ -61,6 +61,39 @@ class DeepSeekClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        return self._request(payload)
+
+    def complete_text(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Plain tagged-response completion used by reasoning trajectories."""
+        completion = self._request({
+            "model": self.model,
+            "messages": messages,
+            "thinking": {"type": "disabled"},
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "stop": ["</tool>", "</｜｜DSML｜｜ parameter>"],
+        })
+        content = completion.message.get("content")
+        if (completion.finish_reason == "stop" and isinstance(content, str)
+                and "<tool>" in content and "</tool>" not in content
+                and content.rstrip().endswith("}")):
+            return Completion(
+                message={**completion.message, "content": content.rstrip() + "</tool>"},
+                finish_reason=completion.finish_reason,
+                request_id=completion.request_id,
+                model=completion.model,
+                usage=completion.usage,
+            )
+        return completion
+
+    def _request(self, payload: dict[str, Any]) -> Completion:
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

@@ -30,8 +30,37 @@ from sql_planner.collect_tagged import (
 )
 from sql_planner.deepseek import DeepSeekAPIError, DeepSeekClient
 
-REPAIR_VERSION = "gold_guided_tagged_suffix_v2"
-GOLD_MENTION = re.compile(r"\b(?:gold|reference|ground.?truth)\s*(?:sql|query|answer)?\b", re.I)
+REPAIR_VERSION = "gold_guided_tagged_suffix_v3_base_system"
+GOLD_MENTION = re.compile(
+    r"\b(?:gold|reference)\s+(?:sql|query|answer)\b|"
+    r"\bground.?truth\b|\b(?:the|training|teacher|privileged|provided)\s+hint\b|"
+    r"\btarget\s+(?:sql|query|answer)\b",
+    re.I,
+)
+REASONING_TAG = re.compile(r"<reasoning>(.*?)</reasoning>", re.S)
+NEUTRAL_REASONING = {
+    "execute_sql": "I will execute this SQL and inspect the actual database result.",
+    "submit_sql": "I will submit this SQL as the final answer.",
+    "inspect_tables": "I will inspect the available columns and table structure.",
+    "inspect_values": "I will inspect sample values to check the query conditions.",
+    "list_tables": "I will list the available database tables.",
+}
+
+
+def sanitize_reasoning_response(
+    content: str, reasoning: str, action: dict[str, Any]
+) -> tuple[str, str, bool]:
+    """Remove teacher-only language while keeping the parsed tool action exact."""
+    if not GOLD_MENTION.search(reasoning):
+        return content, reasoning, False
+    match = REASONING_TAG.search(content)
+    if match is None or match.group(1).strip() != reasoning:
+        raise ValueError("Unexpected reasoning tag during sanitization")
+    replacement = NEUTRAL_REASONING[action["tool"]]
+    updated = content[:match.start(1)] + replacement + content[match.end(1):]
+    if parse_response(updated)[1] != action:
+        raise ValueError("Sanitization changed the tool action")
+    return updated, replacement, True
 
 
 def choose_cutoff(turns: list[dict[str, Any]], *, max_prefix_turns: int = 6) -> tuple[int, str]:
@@ -56,25 +85,29 @@ def choose_cutoff(turns: list[dict[str, Any]], *, max_prefix_turns: int = 6) -> 
     return cutoff, "prefix_turn_cap"
 
 
-def teacher_prompt(max_turns: int) -> str:
-    base = build_prompt(max_turns)
-    return base.replace(
-        "Never use or request the gold SQL or gold result.",
-        "A separate training-only hint may supply the target SQL. Use it to plan a valid continuation, "
-        "but do not mention the hint, gold SQL, or privileged knowledge in reasoning. "
-        "Every claimed observation must come from an actual tool result. "
-        "Before submit_sql, call execute_sql with the exact SQL you intend to submit, "
-        "inspect its real observation, and correct the SQL if necessary.",
+def teacher_prompt(max_turns: int, *, can_test: bool = True) -> str:
+    """Use exactly the ordinary agent system prompt for teacher continuations."""
+    return build_prompt(max_turns)
+
+
+def _hint(gold_sql: str, *, can_test: bool = True) -> str:
+    context_instruction = (
+        "Continue from the current observation. Gather any missing schema evidence. "
+        if can_test else "Continue from the current observation. "
     )
-
-
-def _hint(gold_sql: str) -> str:
-    return (
-        "Training-only target SQL (never quote or mention this hint in your reasoning):\n"
-        + gold_sql
-        + "\nContinue from the current observation. Gather any missing schema evidence. "
+    instruction = (
         "Call execute_sql with the exact final SQL and inspect its real result before calling submit_sql. "
-        "Use one <tool> block per turn."
+        if can_test else
+        "The exploration budget is exhausted. Submit the target SQL now; do not invent an observation. "
+    )
+    return (
+        "The gold SQL for this continuation is:\n"
+        + gold_sql
+        + "\nDo not quote or mention this hint in your reasoning. "
+        + "Every claimed observation must come from an actual tool result. "
+        + context_instruction
+        + instruction
+        + "Use one <tool> block per turn."
     )
 
 
@@ -82,16 +115,29 @@ def repair_trajectory(
     source: dict[str, Any], task: TaskRecord, config: EnvConfig, client: TextClient,
     *, temperature: float = 0.3, max_tokens: int = 2048,
     max_prefix_turns: int = 6, response_retries: int = RESPONSE_RETRIES,
+    cutoff_turn: int | None = None,
+    sanitize_hint_reasoning: bool = True,
+    require_exact_gold_submission: bool = True,
 ) -> dict[str, Any]:
     """Replay a trusted prefix, then generate and execute a gold-guided suffix."""
     if source.get("task_id") != task.task_id or source.get("prompt_version") != SOURCE_PROMPT_VERSION:
         raise ValueError("Source task or tagged prompt version does not match")
-    if source.get("correct") or source.get("status") != "submitted_sql":
-        raise ValueError("Source must be an incorrect submitted trajectory")
+    if source.get("correct") or source.get("status") not in (
+        {"submitted_sql", "invalid_format"} if cutoff_turn is not None else {"submitted_sql"}
+    ):
+        raise ValueError("Source must be an incorrect submitted or invalid-format trajectory")
     original = source.get("turns")
     if not isinstance(original, list):
         raise ValueError("Source turns must be a list")
-    cutoff, cut_reason = choose_cutoff(original, max_prefix_turns=max_prefix_turns)
+    if cutoff_turn is None:
+        cutoff, cut_reason = choose_cutoff(original, max_prefix_turns=max_prefix_turns)
+    else:
+        maximum_cutoff = len(original) + int(source.get("status") == "invalid_format")
+        if not 1 <= cutoff_turn <= maximum_cutoff:
+            raise ValueError("cutoff_turn is outside the source trajectory")
+        if any(turn.get("tool") == "submit_sql" for turn in original[:cutoff_turn - 1]):
+            raise ValueError("DPO prefix contains a final submission")
+        cutoff, cut_reason = cutoff_turn, "explicit_dpo_fork"
     student_prompt = build_prompt(config.max_turns)
     env = SQLAgentEnv(config, reserve_final_submission=True, system_prompt=student_prompt)
     student_messages: list[dict[str, str]] = [
@@ -99,6 +145,8 @@ def repair_trajectory(
         {"role": "user", "content": task.question},
     ]
     turns: list[dict[str, Any]] = []
+    prefix_observation_drift: list[dict[str, Any]] = []
+    sanitized_reasoning_turns: list[int] = []
     rejected_responses: list[dict[str, Any]] = []
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     status = "incomplete"
@@ -125,18 +173,41 @@ def repair_trajectory(
                     raise ValueError("Prefix contains final submission")
                 observation, _ = env.step(action)
                 if canonical_json(observation) != canonical_json(original_turn.get("observation")):
-                    raise ValueError("Prefix observation differs when replayed")
+                    original_observation = original_turn.get("observation") or {}
+                    display_only_truncation = (
+                        action["tool"] == "inspect_tables"
+                        and original_observation.get("status") == "success"
+                        and observation.get("status") == "success"
+                        and observation.get("truncated")
+                        and "token_limit" in observation.get("truncation_reasons", [])
+                        and observation.get("returned_table_count", 0)
+                            <= original_observation.get("returned_table_count", 0)
+                    )
+                    if not display_only_truncation:
+                        raise ValueError("Prefix observation differs when replayed")
+                    prefix_observation_drift.append({
+                        "turn": original_turn["turn"],
+                        "reason": "inspect_tables_display_truncation",
+                    })
                 turns.append({**original_turn, "reasoning": reasoning, "origin": "source_prefix"})
-                student_messages.append({"role": "assistant", "content": response})
-                student_messages.append({"role": "user", "content": f"<observation>{canonical_json(observation)}</observation>"})
+                prefix_index = 2 * len(turns)
+                prefix_messages = source["messages"][prefix_index:prefix_index + 2]
+                if (len(prefix_messages) != 2
+                        or prefix_messages[0] != {"role": "assistant", "content": response}
+                        or prefix_messages[1]["role"] != "user"):
+                    raise ValueError("Source prefix messages do not match recorded turns")
+                student_messages.extend(prefix_messages)
 
-            teacher_messages = [{**student_messages[0], "content": teacher_prompt(config.max_turns)}, *student_messages[1:]]
-            teacher_messages.append({"role": "user", "content": _hint(task.reference_sql)})
+            teacher_messages = [{**student_messages[0], "content": teacher_prompt(
+                config.max_turns, can_test=env.turn < config.max_turns)}, *student_messages[1:]]
+            teacher_messages.append({"role": "user", "content": _hint(
+                task.reference_sql, can_test=env.turn < config.max_turns)})
             while not env.done:
                 issue: str | None = None
+                retry_messages = teacher_messages
                 for retry in range(response_retries + 1):
                     completion = client.complete_text(
-                        teacher_messages, temperature=temperature, max_tokens=max_tokens
+                        retry_messages, temperature=temperature, max_tokens=max_tokens
                     )
                     response_index += 1
                     for key in usage:
@@ -148,8 +219,12 @@ def repair_trajectory(
                         reasoning, action = parse_response(content)
                         if env.turn >= config.max_turns and action["tool"] != "submit_sql":
                             raise ValueError("Only submit_sql is allowed after exploration budget")
-                        if GOLD_MENTION.search(reasoning):
+                        if cutoff_turn is None and GOLD_MENTION.search(reasoning):
                             raise ValueError("Reasoning mentions privileged gold hint")
+                        if (cutoff_turn is not None and require_exact_gold_submission
+                                and action["tool"] == "submit_sql"
+                                and action["arguments"].get("sql") != task.reference_sql):
+                            raise ValueError("Final submission must match the SQL in the continuation instruction")
                         issue = None
                     except ValueError as exc:
                         issue = str(exc)
@@ -160,9 +235,22 @@ def repair_trajectory(
                         "request_id": completion.request_id, "finish_reason": completion.finish_reason,
                         "content": content,
                     })
+                    retry_messages = [*teacher_messages, {"role": "user", "content": (
+                        f"The previous response was rejected: {issue}. "
+                        "Return one valid tagged tool response. "
+                        "Explain the SQL using only the question and database observations; "
+                        "Follow the continuation instruction already provided. "
+                        "Execute the final SQL if the budget allows, then submit it."
+                    )}]
                 if issue is not None:
                     status, error = "invalid_generated_suffix", issue
                     break
+                if cutoff_turn is not None and sanitize_hint_reasoning:
+                    content, reasoning, sanitized = sanitize_reasoning_response(
+                        content, reasoning, action
+                    )
+                    if sanitized:
+                        sanitized_reasoning_turns.append(len(turns) + 1)
                 teacher_messages.append({"role": "assistant", "content": content})
                 student_messages.append({"role": "assistant", "content": content})
                 if action["tool"] == "submit_sql":
@@ -178,7 +266,10 @@ def repair_trajectory(
                     )
                     status = (
                         "repaired" if verification and verification.get("correct") and tested
-                        else "untested_submission" if verification and verification.get("correct")
+                        else "repaired_no_test_budget" if verification and verification.get("correct")
+                        and env.turn >= config.max_turns
+                        else ("repaired_direct_submit" if cutoff_turn is not None
+                              else "untested_submission") if verification and verification.get("correct")
                         else "wrong_final_sql"
                     )
                 else:
@@ -211,9 +302,12 @@ def repair_trajectory(
         "max_prefix_turns": max_prefix_turns,
         "gold_check": gold_check, "gold_hint_sha256": hashlib.sha256(task.reference_sql.encode()).hexdigest(),
         "teacher_model": client.model, "teacher_used_gold_hint": True,
-        "status": status, "error": error, "correct": status == "repaired",
+        "status": status, "error": error,
+        "correct": status in {"repaired", "repaired_no_test_budget", "repaired_direct_submit"},
         "final_sql": final_sql, "verification": verification,
         "tool_sequence": [turn["tool"] for turn in turns],
+        "prefix_observation_drift": prefix_observation_drift,
+        "sanitized_reasoning_turns": sanitized_reasoning_turns,
         "turns": turns, "rejected_responses": rejected_responses,
         "usage": usage,
         "student_messages": student_messages,

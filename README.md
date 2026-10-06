@@ -221,12 +221,28 @@ $$
 
 本次工作交付目录为 `C:/Users/JSWang/Documents/Codex/2026-10-03/yu/outputs/`。首轮数据为 `dpo_pairs_strict.jsonl`；追加批次运行中导出 `dpo_pairs_strict_retry2_merged.partial.jsonl`，全部处理完成且无审核异常后导出 `dpo_pairs_strict_retry2_merged.jsonl`。相关报告为 `dpo_full_generation_report.md` 和 `dpo_retry2_report.md`。
 
-进度快照（2026-10-06 19:07，北京时间；后台会继续更新，以 `report.json` 为准）：状态 `running_or_incomplete`，完成 1101/1574 条，新增接受 215 对，合并 545 对，剩余 473 条，待处理审核异常 23 条。
+最终结果（2026-10-06）：状态 `completed`，完成 1574/1574 条，新增接受 301 对，与原有 330 对合并为 **631 对不同任务的偏好数据**；待处理审核异常为 0。其余 1,273 条追加尝试后未获得合格数据。
 
 ### 7. 训练准备与当前限制
 
 训练前按任务去重；若划分训练与验证集，整道题及其所有派生轨迹进入同一 split。使用目标 SFT 检查点的 tokenizer/chat template，核对 tokenization 和分叉 mask；超出 16,384 token 的分支由当前准备入口报错，不静默截断。
 
-`dpo/train.py` 提供 `score-reference` 和 `train` 两个模式，参考模型和策略模型均从同一 SFT 检查点初始化。当前配置的路径仍指向早期 `reasoning_dpo_all_errors_v1/tokenized`；`dpo/prepare.py` 也要求全量 eligible selection 与 generation report 一致，尚不能直接读取这次审核后的合并 JSONL。实际训练前需要为最终 accept 子集生成兼容的准备清单和 tokenized shards，并更新配置路径。当前后台任务执行的是数据构造与审核，尚未启动本批次 GPU DPO 训练。
+`dpo/prepare.py` 支持严格审核后的 `--pairs-jsonl`，并要求通过 `--audit-roots` 提供两个已完成批次的审核证据。程序逐条检查 JSONL 与 accepted 原件相同、审核为 accept、机械检查无问题、训练集任务不重复，并要求覆盖全部接受子集；原有 `--pairs-dir` 全量准备入口保留。输出 manifest 包含来源和审核哈希、每对长度与 loss token 数、相对 shard 路径及 SHA-256。`dpo/train.py` 加载时校验 shard 哈希；相对路径允许将整个 tokenized 目录搬到 GPU 机器。
+
+在 GPU 机器使用实际 SFT 检查点的 tokenizer 重新准备数据。下例假设合并 JSONL 已复制到仓库的 `data/dpo/`，两个审核目录也已完整复制到 `artifacts/sql_planner/`：
+
+```bash
+python -m dpo.prepare \
+  --pairs-jsonl data/dpo/dpo_pairs_strict_retry2_merged.jsonl \
+  --audit-roots \
+    artifacts/sql_planner/reasoning_dpo_flash_high_strict_all_20261003_v1 \
+    artifacts/sql_planner/reasoning_dpo_flash_high_strict_retry2_20261006_v1 \
+  --model artifacts/sql_planner/reasoning_balanced_2000_500_qwen25_coder_3b_sft/checkpoint_epoch_2 \
+  --output-dir artifacts/sql_planner/reasoning_dpo_strict_631_v1/tokenized
+python -m dpo.train score-reference --config configs/dpo_reasoning_sql_success.yaml
+python -m dpo.train train --config configs/dpo_reasoning_sql_success.yaml
+```
+
+`dpo/train.py` 的参考模型和策略模型均从同一 SFT 检查点初始化，关闭 dropout，使分开计算分数和梯度的前向过程一致。DPO 和后续 GRPO 配置已指向 `reasoning_dpo_strict_631_v1`。运行前核对远端 SFT 检查点及配置的绝对路径；本批次 GPU DPO 训练尚未启动。
 
 评估应记录 `fork_reason`、后缀长度、数据库执行正确率和提交前验证情况，并在固定验证集上比较 SFT、DPO 和后续 GRPO 检查点。

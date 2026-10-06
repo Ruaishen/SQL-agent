@@ -70,8 +70,8 @@ def test_repair_replays_prefix_and_hides_teacher_hint_from_student(sample_db, co
     assert repaired["trainable_turn_numbers"] == [3, 4]
     assert repaired["tool_sequence"] == ["list_tables", "inspect_tables", "execute_sql", "submit_sql"]
     assert repaired["turns"][2]["observation"]["rows"] == [[25]]
-    assert any("Training-only target SQL" in m["content"] for m in teacher.requests[0])
-    assert not any("Training-only target SQL" in m["content"] for m in repaired["student_messages"])
+    assert any("The gold SQL for this continuation is:" in m["content"] for m in teacher.requests[0])
+    assert not any("The gold SQL for this continuation is:" in m["content"] for m in repaired["student_messages"])
     assert all("gold" not in m["content"].lower() for m in repaired["student_messages"] if m["role"] == "user")
 
 

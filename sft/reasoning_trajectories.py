@@ -11,6 +11,15 @@ from transformers import AutoTokenizer
 from sql_agent.tokenizer_check import tokenizer_fingerprint
 
 
+def _trainable_turns(record: dict, assistant_count: int, path: Path) -> set[int]:
+    if record.get("merged_origin") == "gold_repair":
+        cutoff = record.get("cutoff_turn")
+        if type(cutoff) is not int or not 1 <= cutoff <= assistant_count:
+            raise ValueError(f"Gold repair has an invalid cutoff_turn: {path}")
+        return set(range(cutoff, assistant_count + 1))
+    return set(record["trainable_turn_numbers"])
+
+
 def prepare(
     source: Path, model: Path, output: Path, max_sequence_tokens: int,
     selection: Path | None = None,
@@ -51,8 +60,8 @@ def prepare(
             prompt = messages[0]["content"]
         elif messages[0]["content"] != prompt:
             raise ValueError(f"Mixed system prompts: {path}")
-        trainable = set(record["trainable_turn_numbers"])
         assistant_count = sum(message["role"] == "assistant" for message in messages)
+        trainable = _trainable_turns(record, assistant_count, path)
         if not trainable or not trainable.issubset(set(range(1, assistant_count + 1))):
             raise ValueError(f"Invalid trainable turn numbers: {path}")
         turns = []
