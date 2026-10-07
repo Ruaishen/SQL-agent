@@ -41,7 +41,7 @@ sql-planner-collect-spider = "sql_planner.collect_spider_train:main"
 sql-agent-sql-similarity = "evaluation.sql_similarity:main"
 
 [tool.setuptools.packages.find]
-include = ["sql_agent*", "sql_planner*", "data*", "evaluation*", "sft*", "dpo*", "grpo*", "third_party*"]
+include = ["sql_agent*", "sql_planner*", "data*", "evaluation*", "sft*", "grpo*", "third_party*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

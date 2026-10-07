@@ -1,7 +1,7 @@
 # Spider CoT binary execution GRPO
 
 Use `configs/grpo_reasoning_tool_standard.yaml` to initialize from the CoT SFT
-checkpoint, or `configs/grpo_reasoning_tool_after_dpo.yaml` to initialize from DPO.
+checkpoint.
 For every question the current policy samples six independent trajectories.
 The final submitted SQL receives reward 1 if its execution result matches the
 reference SQL's result, otherwise 0. Group-relative advantages are computed from
@@ -22,7 +22,7 @@ python -m grpo.train --config configs/grpo_reasoning_tool_standard.yaml --env-co
 
 Verify the model, data, and output paths on the training host before preparing.
 Use a fresh output directory for a new run. Enabling Gold injection is rejected.
-SFT/DPO data repair remains separate from this RL rollout path.
+SFT data repair remains separate from this RL rollout path.
 
 Training logs include execution accuracy, all-zero/all-one/mixed group counts,
 and `policy_clip_fraction`. The latter counts nonzero-advantage assistant tokens

@@ -62,6 +62,44 @@ def summary(records: list[dict], total: int) -> dict:
     }
 
 
+def force_final_submission(state: dict) -> None:
+    sql = state["env"].last_executed_sql
+    if sql is None:
+        state["status"] = "missing_submission"
+        state["done"] = True
+        return
+    arguments = {"sql": sql}
+    observation, _ = state["env"].submit_sql(arguments)
+    response = (
+        "<reasoning>The exploration budget is exhausted; submit the last executed SQL.</reasoning>\n"
+        f"<tool>{canonical_json({'name': 'submit_sql', 'arguments': arguments})}</tool>"
+    )
+    state["turns"].append({
+        "response": response,
+        "tool": "submit_sql",
+        "arguments": arguments,
+        "observation": observation,
+        "source": "evaluator_fallback",
+        "reason": "exploration_budget_exhausted",
+    })
+    state["final_sql"] = sql
+    state["verification"] = observation.get("verification")
+    state["correct"] = bool((state["verification"] or {}).get("correct"))
+    state["status"] = "forced_submit_sql"
+    state["forced_submission"] = True
+    state["done"] = True
+
+
+def with_remaining_rounds(content: str, exploration_remaining: int) -> str:
+    reminder = (
+        f"当前剩余轮数：{exploration_remaining + 1}（包含本轮和最终提交轮）；"
+        f"剩余探索轮数：{exploration_remaining}。"
+    )
+    if exploration_remaining == 0:
+        reminder += "\n这是最后一轮。请在此轮使用submit_sql工具提交SQL。"
+    return f"{content}\n\n{reminder}"
+
+
 def evaluate_batch(tasks, llm, tokenizer, prompt: str, config: EnvConfig, max_tokens: int) -> list[dict]:
     states = []
     for task in tasks:
@@ -71,12 +109,16 @@ def evaluate_batch(tasks, llm, tokenizer, prompt: str, config: EnvConfig, max_to
         states.append({
             "task": task,
             "env": env,
-            "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": task.question}],
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": with_remaining_rounds(task.question, config.max_turns)},
+            ],
             "turns": [],
             "status": "missing_submission",
             "correct": False,
             "final_sql": None,
             "verification": None,
+            "forced_submission": False,
             "done": False,
         })
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens, stop=["</tool>"])
@@ -95,6 +137,7 @@ def evaluate_batch(tasks, llm, tokenizer, prompt: str, config: EnvConfig, max_to
                 response += "</tool>"
             turn = {"response": response}
             state["turns"].append(turn)
+            final_round = state["env"].turn >= config.max_turns
             try:
                 name, arguments = parse_response(response)
                 turn["tool"] = name
@@ -107,19 +150,25 @@ def evaluate_batch(tasks, llm, tokenizer, prompt: str, config: EnvConfig, max_to
                     state["status"] = "submitted_sql"
                     state["done"] = True
                     continue
-                if state["env"].turn >= config.max_turns:
+                if final_round:
                     raise ValueError("Exploration budget exhausted")
                 observation, done = state["env"].step({"tool": name, "arguments": arguments})
                 turn["observation"] = observation
                 state["messages"].extend([
                     {"role": "assistant", "content": response},
-                    {"role": "user", "content": f"<observation>{canonical_json(observation)}</observation>"},
+                    {"role": "user", "content": with_remaining_rounds(
+                        f"<observation>{canonical_json(observation)}</observation>",
+                        config.max_turns - state["env"].turn,
+                    )},
                 ])
                 if done:
                     state["status"] = observation.get("termination_reason", "environment_done")
                     state["done"] = True
             except (ValueError, RuntimeError) as exc:
                 turn["error"] = str(exc)
+                if final_round:
+                    force_final_submission(state)
+                    continue
                 state["status"] = "invalid_response"
                 state["done"] = True
     results = []
@@ -134,6 +183,7 @@ def evaluate_batch(tasks, llm, tokenizer, prompt: str, config: EnvConfig, max_to
             "correct": state["correct"],
             "final_sql": state["final_sql"],
             "verification": state["verification"],
+            "forced_submission": state["forced_submission"],
             "turns": state["turns"],
         })
     return results
@@ -149,6 +199,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.82)
+    parser.add_argument("--max-num-seqs", type=int, default=16)
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
     config = EnvConfig.from_yaml(args.env_config)
@@ -173,6 +225,8 @@ def main() -> None:
         "max_turns": config.max_turns,
         "temperature": 0.0,
         "scorer": "ExecutionVerifier",
+        "final_submission_policy": "model_submit_then_last_executed_sql_on_budget_exhaustion",
+        "round_prompt_version": "remaining_rounds_v1",
     }
     manifest_path = args.output_dir / "manifest.json"
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != eval_manifest:
@@ -181,7 +235,9 @@ def main() -> None:
     pending = [t for t in tasks if not (records_dir / f"{t.task_id}.json").exists()]
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if pending:
-        llm = LLM(model=str(args.model), dtype="bfloat16", max_model_len=16384, gpu_memory_utilization=0.82, max_num_seqs=16)
+        llm = LLM(model=str(args.model), dtype="bfloat16", max_model_len=16384,
+                  gpu_memory_utilization=args.gpu_memory_utilization,
+                  max_num_seqs=args.max_num_seqs)
         for start in range(0, len(pending), args.batch_size):
             for record in evaluate_batch(pending[start:start + args.batch_size], llm, tokenizer, prompt, config, args.max_tokens):
                 (records_dir / f"{record['task_id']}.json").write_text(json.dumps(record, ensure_ascii=False) + "\n")
