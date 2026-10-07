@@ -28,21 +28,28 @@ def _prepare_record(tmp_path, monkeypatch, *, origin, cutoff=None):
         {"role": "user", "content": "question"},
     ]
     for turn in range(1, 4):
-        messages.append({
-            "role": "assistant",
-            "content": f"<reasoning>step {turn}</reasoning><tool>action {turn}</tool>",
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"<reasoning>step {turn}</reasoning><tool>action {turn}</tool>",
+            }
+        )
         if turn < 3:
             messages.append({"role": "user", "content": "<observation>result</observation>"})
     record = {
-        "task_id": "spider_train_00001", "split": "train", "correct": True,
-        "merged_origin": origin, "messages": messages,
+        "task_id": "spider_train_00001",
+        "split": "train",
+        "correct": True,
+        "merged_origin": origin,
+        "messages": messages,
         "trainable_turn_numbers": [1, 2, 3],
     }
     if cutoff is not None:
         record["cutoff_turn"] = cutoff
     (trajectory_dir / "example.json").write_text(json.dumps(record), encoding="utf-8")
-    monkeypatch.setattr("sft.reasoning_trajectories.AutoTokenizer.from_pretrained", lambda _: _Tokenizer())
+    monkeypatch.setattr(
+        "sft.reasoning_trajectories.AutoTokenizer.from_pretrained", lambda _: _Tokenizer()
+    )
     monkeypatch.setattr("sft.reasoning_trajectories.tokenizer_fingerprint", lambda _: "fake")
     output = tmp_path / "dataset"
     statistics = prepare(source, tmp_path / "model", output, 2048)
@@ -50,12 +57,10 @@ def _prepare_record(tmp_path, monkeypatch, *, origin, cutoff=None):
     return statistics, shard
 
 
-def test_gold_repair_trains_only_fork_and_suffix(tmp_path, monkeypatch):
-    statistics, shard = _prepare_record(
-        tmp_path, monkeypatch, origin="gold_repair", cutoff=2
-    )
-    assert [turn["turn"] for turn in shard["turns"]] == [2, 3]
-    assert statistics["turns"] == 2
+def test_full_gold_regeneration_trains_all_assistant_turns(tmp_path, monkeypatch):
+    statistics, shard = _prepare_record(tmp_path, monkeypatch, origin="gold_regeneration")
+    assert [turn["turn"] for turn in shard["turns"]] == [1, 2, 3]
+    assert statistics["turns"] == 3
     assert statistics["action_tokens"] == sum(
         int(turn["action_mask"].sum()) for turn in shard["turns"]
     )
@@ -73,6 +78,6 @@ def test_original_trajectory_still_trains_every_selected_turn(tmp_path, monkeypa
     assert statistics["turns"] == 3
 
 
-def test_gold_repair_requires_valid_cutoff(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match="invalid cutoff_turn"):
+def test_old_forked_gold_suffixes_are_rejected(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="Forked Gold suffixes"):
         _prepare_record(tmp_path, monkeypatch, origin="gold_repair")

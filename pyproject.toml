@@ -29,19 +29,24 @@ train = [
 [project.scripts]
 sql-agent-preprocess = "data.preprocess_spider:app"
 sql-agent-eval = "evaluation.run_eval:app"
-sql-agent-sft-collect = "sft.collect:main"
+sql-agent-sft-collect = "sft.collect_reasoning:main"
+sql-agent-sft-curate = "sft.curate_reasoning:main"
+sql-agent-sft-prepare = "sft.reasoning_trajectories:main"
+sql-agent-sft-regenerate = "sft.regenerate_reasoning:main"
 sql-agent-sft-status = "sft.status:main"
 sql-agent-sft-train = "sft.train:main"
 sql-agent-sft-train-status = "sft.train_status:main"
 sql-agent-grpo-prepare = "grpo.prepare:main"
 sql-agent-grpo-train = "grpo.train:main"
 sql-agent-grpo-status = "grpo.status:main"
-sql-planner-collect = "sql_planner.collect:main"
-sql-planner-collect-spider = "sql_planner.collect_spider_train:main"
 sql-agent-sql-similarity = "evaluation.sql_similarity:main"
+sql-agent-memory-evolve = "experience_memory.evolve:main"
 
 [tool.setuptools.packages.find]
-include = ["sql_agent*", "sql_planner*", "data*", "evaluation*", "sft*", "grpo*", "third_party*"]
+include = ["sql_agent*", "data*", "evaluation*", "sft*", "grpo*", "third_party*", "experience_memory*"]
+
+[tool.setuptools.package-data]
+sft = ["prompts/*.md"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

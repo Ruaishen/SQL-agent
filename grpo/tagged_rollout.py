@@ -14,7 +14,7 @@ from sql_agent.config import EnvConfig
 from sql_agent.env import SQLAgentEnv
 from sql_agent.models import TaskRecord
 from sql_agent.truncation import canonical_json
-from sql_planner.collect_tagged import build_prompt, parse_response
+from sql_agent.protocol import build_prompt, parse_tagged_response as parse_response
 
 
 class _OneToolStop(StoppingCriteria):

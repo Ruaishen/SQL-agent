@@ -71,19 +71,25 @@ class DeepSeekClient:
         max_tokens: int,
     ) -> Completion:
         """Plain tagged-response completion used by reasoning trajectories."""
-        completion = self._request({
-            "model": self.model,
-            "messages": messages,
-            "thinking": {"type": "disabled"},
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-            "stop": ["</tool>", "</｜｜DSML｜｜ parameter>"],
-        })
+        completion = self._request(
+            {
+                "model": self.model,
+                "messages": messages,
+                "thinking": {"type": "disabled"},
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+                "stop": ["</tool>", "</｜｜DSML｜｜ parameter>"],
+            }
+        )
         content = completion.message.get("content")
-        if (completion.finish_reason == "stop" and isinstance(content, str)
-                and "<tool>" in content and "</tool>" not in content
-                and content.rstrip().endswith("}")):
+        if (
+            completion.finish_reason == "stop"
+            and isinstance(content, str)
+            and "<tool>" in content
+            and "</tool>" not in content
+            and content.rstrip().endswith("}")
+        ):
             return Completion(
                 message={**completion.message, "content": content.rstrip() + "</tool>"},
                 finish_reason=completion.finish_reason,
@@ -92,6 +98,40 @@ class DeepSeekClient:
                 usage=completion.usage,
             )
         return completion
+
+    def complete_reflection(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int = 1024,
+    ) -> Completion:
+        """Structured experience extraction, without trajectory stop markers."""
+        return self._request(
+            {
+                "model": self.model,
+                "messages": messages,
+                "thinking": {"type": "disabled"},
+                "temperature": 0.0,
+                "max_tokens": max_tokens,
+                "stream": False,
+                "response_format": {"type": "json_object"},
+            }
+        )
+
+    def complete_thinking_text(
+        self, messages: list[dict[str, Any]], *, max_tokens: int = 8192
+    ) -> Completion:
+        """Teacher-only high-effort generation/audit; replay reasoning_content."""
+        return self._request(
+            {
+                "model": self.model,
+                "messages": messages,
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+        )
 
     def _request(self, payload: dict[str, Any]) -> Completion:
         request = urllib.request.Request(

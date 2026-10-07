@@ -32,7 +32,7 @@ python -m evaluation.run_v5_voting \
   --endpoint http://127.0.0.1:8004 \
   --model /root/autodl-tmp/Qwen2.5-Coder-3B-Instruct \
   --task-file data/external_dev.jsonl \
-  --env-config configs/env_sql_planner_qwen25_coder_3b.yaml \
+  --env-config configs/env.yaml \
   --spider-root /root/autodl-tmp/sqlagent/datasets/spider/spider_data \
   --source-dir artifacts/sql_planner/qwen25_coder_3b_base_direct_seeded_evidence_columns_v5_eval \
   --output-dir "$output_dir" --samples 8 --workers 16

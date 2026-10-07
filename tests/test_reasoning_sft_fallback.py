@@ -1,10 +1,23 @@
 import json
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from evaluation.run_reasoning_sft import evaluate_batch
+
+
+@pytest.fixture(autouse=True)
+def scripted_sampling_parameters(monkeypatch):
+    # These tests exercise SQLite episodes with a scripted LLM, not vLLM execution.
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        SimpleNamespace(
+            SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs),
+        ),
+    )
 
 
 class ScriptedLLM:
@@ -14,9 +27,12 @@ class ScriptedLLM:
 
     def generate(self, prompts, params, use_tqdm):
         self.calls += 1
-        return [SimpleNamespace(outputs=[SimpleNamespace(
-            text=next(self.responses), finish_reason="stop"
-        )]) for prompt in prompts]
+        return [
+            SimpleNamespace(
+                outputs=[SimpleNamespace(text=next(self.responses), finish_reason="stop")]
+            )
+            for prompt in prompts
+        ]
 
 
 class Tokenizer:
@@ -33,18 +49,23 @@ def response(name, arguments):
     return f"<reasoning>Use the requested tool.</reasoning><tool>{action}</tool>"
 
 
-@pytest.mark.parametrize("last_sql,correct", [
-    ("SELECT count(*) FROM employees", True),
-    ("SELECT count(*) FROM nonexistent_table", False),
-])
+@pytest.mark.parametrize(
+    "last_sql,correct",
+    [
+        ("SELECT count(*) FROM employees", True),
+        ("SELECT count(*) FROM nonexistent_table", False),
+    ],
+)
 def test_budget_forces_latest_executed_sql_even_if_it_failed(
     sample_db, config, task, last_sql, correct
 ):
-    llm = ScriptedLLM([
-        response("execute_sql", {"sql": "SELECT count(*) FROM employees"}),
-        response("execute_sql", {"sql": last_sql}),
-        "invalid response",
-    ])
+    llm = ScriptedLLM(
+        [
+            response("execute_sql", {"sql": "SELECT count(*) FROM employees"}),
+            response("execute_sql", {"sql": last_sql}),
+            "invalid response",
+        ]
+    )
     records = evaluate_batch([task], llm, Tokenizer(), "prompt", replace(config, max_turns=2), 512)
     record = records[0]
     assert llm.calls == 3
@@ -58,14 +79,16 @@ def test_budget_forces_latest_executed_sql_even_if_it_failed(
 
 def test_other_last_tool_does_not_erase_previous_sql(sample_db, config, task):
     sql = "SELECT count(*) FROM employees"
-    llm = ScriptedLLM([
-        response("execute_sql", {"sql": sql}),
-        response("list_tables", {}),
-        response("execute_sql", {"sql": "SELECT 0"}),
-    ])
-    record = evaluate_batch(
-        [task], llm, Tokenizer(), "prompt", replace(config, max_turns=2), 512
-    )[0]
+    llm = ScriptedLLM(
+        [
+            response("execute_sql", {"sql": sql}),
+            response("list_tables", {}),
+            response("execute_sql", {"sql": "SELECT 0"}),
+        ]
+    )
+    record = evaluate_batch([task], llm, Tokenizer(), "prompt", replace(config, max_turns=2), 512)[
+        0
+    ]
     assert record["final_sql"] == sql
     assert record["correct"] is True
     assert llm.calls == 3
@@ -73,9 +96,9 @@ def test_other_last_tool_does_not_erase_previous_sql(sample_db, config, task):
 
 def test_budget_without_executed_sql_does_not_invent_submission(sample_db, config, task):
     llm = ScriptedLLM([response("list_tables", {}), "invalid response"])
-    record = evaluate_batch(
-        [task], llm, Tokenizer(), "prompt", replace(config, max_turns=1), 512
-    )[0]
+    record = evaluate_batch([task], llm, Tokenizer(), "prompt", replace(config, max_turns=1), 512)[
+        0
+    ]
     assert record["status"] == "missing_submission"
     assert record["final_sql"] is None
     assert record["forced_submission"] is False
@@ -85,9 +108,9 @@ def test_budget_without_executed_sql_does_not_invent_submission(sample_db, confi
 
 def test_model_submission_before_budget_is_preserved(sample_db, config, task):
     llm = ScriptedLLM([response("submit_sql", {"sql": "SELECT count(*) FROM employees"})])
-    record = evaluate_batch(
-        [task], llm, Tokenizer(), "prompt", replace(config, max_turns=1), 512
-    )[0]
+    record = evaluate_batch([task], llm, Tokenizer(), "prompt", replace(config, max_turns=1), 512)[
+        0
+    ]
     assert record["status"] == "submitted_sql"
     assert record["correct"] is True
     assert record["forced_submission"] is False
@@ -95,13 +118,15 @@ def test_model_submission_before_budget_is_preserved(sample_db, config, task):
 
 
 def test_early_format_error_is_not_replaced_with_fallback(sample_db, config, task):
-    llm = ScriptedLLM([
-        response("execute_sql", {"sql": "SELECT count(*) FROM employees"}),
-        "invalid response",
-    ])
-    record = evaluate_batch(
-        [task], llm, Tokenizer(), "prompt", replace(config, max_turns=3), 512
-    )[0]
+    llm = ScriptedLLM(
+        [
+            response("execute_sql", {"sql": "SELECT count(*) FROM employees"}),
+            "invalid response",
+        ]
+    )
+    record = evaluate_batch([task], llm, Tokenizer(), "prompt", replace(config, max_turns=3), 512)[
+        0
+    ]
     assert record["status"] == "invalid_response"
     assert record["forced_submission"] is False
     assert record["final_sql"] is None
@@ -109,15 +134,15 @@ def test_early_format_error_is_not_replaced_with_fallback(sample_db, config, tas
 
 def test_remaining_rounds_and_final_submission_reminder(sample_db, config, task):
     sql = "SELECT count(*) FROM employees"
-    llm = ScriptedLLM([
-        response("execute_sql", {"sql": sql}),
-        response("list_tables", {}),
-        response("submit_sql", {"sql": sql}),
-    ])
+    llm = ScriptedLLM(
+        [
+            response("execute_sql", {"sql": sql}),
+            response("list_tables", {}),
+            response("submit_sql", {"sql": sql}),
+        ]
+    )
     tokenizer = Tokenizer()
-    record = evaluate_batch(
-        [task], llm, tokenizer, "prompt", replace(config, max_turns=2), 512
-    )[0]
+    record = evaluate_batch([task], llm, tokenizer, "prompt", replace(config, max_turns=2), 512)[0]
     for index, messages in enumerate(tokenizer.messages):
         content = messages[-1]["content"]
         assert f"当前剩余轮数：{3 - index}" in content

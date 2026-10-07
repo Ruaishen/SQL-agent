@@ -17,7 +17,7 @@ scored with `kl_beta: 0.0`.
 
 ```bash
 python -m grpo.prepare --config configs/grpo_reasoning_tool_standard.yaml
-python -m grpo.train --config configs/grpo_reasoning_tool_standard.yaml --env-config configs/env_sql_planner_qwen25_coder_3b.yaml --max-steps 128
+python -m grpo.train --config configs/grpo_reasoning_tool_standard.yaml --env-config configs/env.yaml --max-steps 128
 ```
 
 Verify the model, data, and output paths on the training host before preparing.

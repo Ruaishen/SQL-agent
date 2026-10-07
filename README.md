@@ -1,107 +1,173 @@
-# SQL Agent RL
+# SQL Agent：SFT、GRPO 与记忆自进化
 
-基于 Spider 1.0 的多轮 Text-to-SQL 项目。项目支持成功轨迹 SFT 和 Binary GRPO；`sql_agent/` 提供共同的只读 SQLite 环境与执行验证器，`evaluation/` 提供重新评测所需的代码。
+基于 Spider 1.0 的多轮 Text-to-SQL 项目。当前主线是：构造完整推理与工具轨迹 → SFT → 可选 GRPO → 冻结最终模型权重 → 只追加经学生重试验证的经验记忆。
 
-原始 Spider 数据集位于 `../datasets/spider/spider_data/`。仓库内的预处理数据、训练轨迹、检查点和历史评测记录均已清理；运行下列步骤会重新生成它们。配置中的模型路径和输出路径沿用原远程环境示例，运行前请改成实际路径。
+## 项目结构
 
-## 准备数据与环境
+| 目录 | 用途 |
+|---|---|
+| `sql_agent/` | 只读 SQLite 环境、工具、执行验证器、公共提示词与解析器、DeepSeek 客户端 |
+| `sft/` | 原始轨迹采集、Gold 辅助完整重生成、筛选、学生 tokenizer 转换和 SFT 训练 |
+| `grpo/` | 保留的在线 Binary GRPO 与 reasoning/tool rollout |
+| `experience_memory/` | 通用经验检索、教师反思、学生重试、成功入库和多轮续跑 |
+| `evaluation/` | 学生推理与评测、基线对照和历史评测辅助工具 |
+| `data/`、`configs/` | 数据划分和运行配置 |
+| `artifacts/` | 本地生成数据、记忆库、模型和实验记录，不纳入 Git |
+
+已移除 SQL-Planner 包、其命令与专属测试，以及旧 DPO 相关入口。被 SFT、GRPO 和记忆流程共同使用的能力迁入公共模块。历史 `artifacts/sql_planner/` 数据保留，目录名属于历史产物路径，新运行推荐使用 `artifacts/sft/` 和 `artifacts/experience_memory/`。
+
+## 环境和数据划分
 
 ```bash
 pip install -e '.[train,dev]'
-python -m data.preprocess_spider \
-  --spider-root ../datasets/spider/spider_data \
-  --output-dir data --seed 42
+python -m data.preprocess_spider --config-path configs/env.yaml
+```
+
+先修改 `configs/env.yaml` 中的 `spider_root`、`processed_data_root` 和 `tokenizer_path`，指向实际数据库、输出目录与学生 tokenizer。GPU 推理入口另外需要与运行环境匹配的 vLLM。
+
+预处理按数据库划分 `train`、`internal_validation`、`internal_holdout`，外部开发集记为 `external_dev`。SFT 构造和记忆新增只使用权威任务文件中标为 `train` 的题目。验证集用于模型选择，最终保留集用于泛化评测；不从保留集补足训练配额。
+
+历史采集可能覆盖整个官方训练文件，其中部分数据库已被当前划分留作验证或保留集。新构造器以 `--tasks data/train.jsonl` 为准，跳过其他来源；评估已有 checkpoint 时还需核对其实际训练覆盖范围。
+
+## 统一交互协议
+
+每次助手回复为一个非空 `<reasoning>...</reasoning>`，随后一个 `<tool>{"name":"...","arguments":{...}}</tool>`。可调用 `list_tables`、`inspect_tables`、`inspect_values`、`execute_sql`、`submit_sql`；真实工具反馈以 `<observation>` 返回。
+
+默认最多 10 次探索，另保留一次最终提交。初始只提供问题，由模型通过工具发现 schema。数据库只读，执行观察受行数与 token 限制；最终评分重新执行完整 SQL。执行成功不等于回答正确，空结果也不自动代表错误。
+
+公共协议位于 `sql_agent/protocol.py`。从头重生成时保留来源轨迹的原 system 提示词，避免悄悄改变已确认的 SFT 条件。
+
+## 新的 SFT 数据构造
+
+按“SFT 数据”对话已确认的方案，数据由两类完整轨迹组成：
+
+1. 原始执行正确轨迹：保留真实 reasoning、工具调用和 observation。
+2. 原始错题的 Gold 辅助完整重生成：先验证 Gold 可执行，从原问题重新开始，不复用错误前缀，也不从分叉点续写。
+
+教师重生成使用 DeepSeek Flash 文本模型、thinking enabled、reasoning effort high。生成时保留原 system 提示词，在教师上下文中追加已确认的补充提示；Gold 与补充提示不进入学生消息。私有 `reasoning_content` 只在教师调用间重放并单独归档。
+
+重生成必须真实执行并提交所提供 Gold，两个工具参数中解码后的 SQL 字符串与 Gold 完全一致，包括空白、别名和分号。成功执行该 SQL 后，下一轮提交相同 SQL。不能靠字符串替换或编造 observation 得到正确轨迹。
+
+独立审核只接收学生可见消息，按照已确认的提示词仅输出 `accept` 或 `reject`。只保存执行验证通过、审核为 `accept` 的候选；拒绝后重新生成，不能删词或改写 reasoning 来包装合格数据。审核存在漏检可能，`accept` 只代表通过该次审核。
+
+此前发现的“calibration query”漏检由用户另行处理，本次不额外修补该项，也不复核或改写已有产物。
+
+已确认的教师补充和审核提示保存在 `sft/prompts/`。以下命令会调用 API；密钥仅从环境变量 `DEEPSEEK_API_KEY` 读取，不写入仓库。
+
+### 采集原始轨迹（已有原始数据可跳过）
+
+```bash
+python -m sft.collect_reasoning \
+  --tasks data/train.jsonl --env-config configs/env.yaml \
+  --spider-root /path/to/spider_data --model YOUR_DEEPSEEK_MODEL \
+  --output-dir artifacts/sft/original --limit 100
+```
+
+原始采集不向教师提供 Gold。可通过 `--samples-per-task` 采集多个候选，正确性由程序执行验证。
+
+### 对原始错题完整重生成
+
+```bash
+python -m sft.regenerate_reasoning \
+  --source artifacts/sql_planner/reasoning \
+  --tasks data/train.jsonl --env-config configs/env.yaml \
+  --spider-root /path/to/spider_data --model deepseek-flash \
+  --output-dir artifacts/sft/gold_regenerated \
+  --attempts 3 --limit 100
+```
+
+保存各次尝试和私有教师记录，正式 `trajectories/` 仅写审核通过的学生可见轨迹。同一参数支持续跑；失败候选不混入正式源数据。已有批量任务及其输出继续保留，本次不重新调用 API。
+
+### 筛选、去重和执行复核
+
+```bash
+python -m sft.curate_reasoning \
+  --original artifacts/sql_planner/reasoning \
+  --regenerated artifacts/sql_planner/reasoning_gold_repair_flash_high_v3 \
+  --tasks data/train.jsonl --env-config configs/env.yaml \
+  --spider-root /path/to/spider_data --output artifacts/sft/curated
+```
+
+构造器优先选择通过检查的原始正确轨迹，同题只保留一个示例；再用合格的完整重生成补充覆盖。检查学生消息与动作一致、真实工具重放结果一致、最终 SQL 已成功执行、最终结果正确，以及重生成的审核标记。完整重生成另外要求最后执行后立即提交相同 Gold。源数据不改写，拒绝原因写入 `audit.json`。
+
+这里的质量筛选和 SFT 同题去重只作用于训练数据构造。记忆库仍只追加，不做语义合并、修订或停用。
+
+## 转换与 SFT 训练
+
+```bash
+python -m sft.reasoning_trajectories \
+  --source artifacts/sft/curated --model /path/to/student-base-model \
+  --output artifacts/sft/dataset --max-sequence-tokens 16384
+python -m sft.train --config configs/sft_reasoning.yaml
+python -m sft.train_status --config configs/sft_reasoning.yaml
+```
+
+先修改 `configs/sft_reasoning.yaml` 中的学生模型路径。使用学生 tokenizer 和 chat template 转换，完整轨迹的所有 assistant reasoning/action 轮参与监督；system、user、工具 observation 不计算目标 loss。现有训练器按轨迹的监督 token 数归一化，避免长轨迹仅因长度获得更大权重。
+
+旧分叉 Gold 修复的后缀监督规则不进入新数据主线。数据转换拒绝旧 `gold_repair` 后缀记录，并对序列长度、提示词一致性和训练划分做检查。SFT 阶段更新模型权重；训练结束后选择 checkpoint，再进入冻结权重阶段。
+
+## GRPO（保留的可选阶段）
+
+```bash
+python -m grpo.prepare --config configs/grpo_reasoning_tool_standard.yaml
+python -m grpo.train --config configs/grpo_reasoning_tool_standard.yaml
+python -m grpo.status --config configs/grpo_reasoning_tool_standard.yaml
+```
+
+运行前修改该配置的 Student、Reference、数据和输出路径。GRPO 在线采样多轮轨迹，以 SQL 执行正确性产生 binary reward，只更新生成 action token；不向策略注入 Gold。
+
+GRPO 会更新权重，因此如需使用它，应先完成 GRPO，再冻结最终 checkpoint 进行记忆自进化。当前 GRPO rollout 不检索经验记忆，记忆自进化也不调用 GRPO 训练。原有 JSON action 版配置和代码仍保留。
+
+## 冻结权重的记忆自进化
+
+每轮使用同一学生 checkpoint 和冻结的记忆快照：
+
+```text
+已有记忆检索 → 学生首次推理 → 执行评测
+  首次答错 → 教师看错误轨迹与 Gold → 一条候选通用经验
+  新 episode：原问题 + 旧记忆 + 候选经验 → 学生重新推理
+  首次错、重试对 → 追加记忆；其他情况只留实验记录
+下一轮使用追加后的记忆，模型权重保持不变
+```
+
+候选经验不提前进入正式库。写入时读取两次记录，要求正确性严格分别为 false 和 true，再重新执行两条 SQL 验证。重试须由学生实际提交，评测器兜底提交不满足入库条件。超时、Gold 异常和没有最终 SQL 的失败跳过。
+
+每条记忆只保存：`memory_id`、`experience`、`sql_before`、`sql_after`、`source_task_id`、`source_split`、`initial_record_path`、`retry_record_path`。标题含义、适用条件和改进建议写成一个 `experience` 字段；全部为通用经验，不设数据库专属条目。修改后 SQL 来自学生成功重试。
+
+不在记忆条目中保存正确性标记、模型名、记忆版本、检索 ID、时间、轮次或候选 ID。必要的模型配置和验证证据独立保存在实验记录中。
+
+检索当前采用 `experience` 上的 TF-IDF，命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 3 条，有 token 预算，无匹配则不注入。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
+
+```bash
+python -m experience_memory.evolve \
+  --model /path/to/frozen-checkpoint --dataset artifacts/sft/dataset \
+  --tasks data/train.jsonl --env-config configs/env.yaml \
+  --spider-root /path/to/spider_data --teacher-model YOUR_DEEPSEEK_MODEL \
+  --memory-db artifacts/experience_memory/memories.sqlite \
+  --output-dir artifacts/experience_memory/run_001 \
+  --rounds 1 --limit 100 --memory-top-k 3 --memory-max-tokens 1536
+```
+
+整轮结束后追加成功经验，下一轮再使用。详细记录、续跑方式和限制见 `docs/experience_memory.md`。
+
+## 评测与效果边界
+
+```bash
+python -m evaluation.run_reasoning_sft \
+  --model /path/to/frozen-checkpoint --dataset artifacts/sft/dataset \
+  --tasks data/internal_holdout.jsonl --env-config configs/env.yaml \
+  --spider-root /path/to/spider_data --output-dir artifacts/evaluation/with_memory \
+  --memory-db artifacts/experience_memory/memories.sqlite
+```
+
+不传 `--memory-db` 即无记忆评测，使用另一个输出目录保存对照。保留集和外部开发集只评分，不用其 Gold 生成记忆。模型选择使用 validation，不反复用最终保留集挑 checkpoint。
+
+分别报告首次正确率、错题重试修复率、新增记忆数、未见题执行准确率，以及有/无记忆的错→对、对→错和成本。原题重试成功仅证明满足入库规则，不能单独证明经验的因果作用或泛化收益。单库执行结果一致也可能包含偶然正确；更强语义验证需额外 test-suite。
+
+## 验证
+
+```bash
 pytest -q
 ```
 
-Agent 每轮输出一个 JSON action，可调用 `list_tables`、`inspect_table`、`inspect_tables`、`inspect_values`、`execute_sql`。环境只允许只读 SQLite SELECT/WITH；常规环境回合结束时用最近一次 `execute_sql` 的 SQL 进行执行结果验证。SQL-Planner 采集的独立提交规则见下文。
-
-当前默认环境、SFT 轨迹采集、GRPO 和评测配置均最多交互 10 轮。`execute_sql` 最多返回 50 行，`inspect_values` 最多返回 50 个不同值；`list_tables`、`inspect_table` 的表、列、外键上限分别为 128、128、128。单条观察最多 1024 token，单个文本值最多 512 字符，因此较宽的结果可能在达到 50 行之前再次截断；观察中的 `truncation_reasons` 会说明原因。最终验证器重新执行完整 SQL，不使用截断后的观察结果。
-
-环境上下文、SFT 采集、SFT 训练及 GRPO 轨迹的长度上限均为 16384 token；更长的轨迹会增加训练显存占用。默认设置见 `configs/env.yaml`，对应的评测环境设置见 `configs/env_eval_10turn.yaml`。运行前应同时核对环境与训练配置，避免轮数或序列长度不一致。
-
-## SFT
-
-`sft.collect` 使用 Teacher 生成并筛选执行正确的多轮轨迹，`sft.train` 对 Student 做 action-only SFT。运行前在配置中填写可用的 Teacher、Student 和数据路径。
-
-```bash
-python -m sft.collect --config configs/sft_cold_start_v2.yaml
-python -m sft.train --config configs/sft_train_v2.yaml
-python -m sft.train_status --config configs/sft_train_v2.yaml
-```
-
-## GRPO
-
-`grpo.prepare` 从预处理后的训练集按难度选择任务；当前配置直接以 SFT 最终检查点初始化 Student 和 Reference，不依赖已删除的 self-training 产物。随后 `grpo.train` 在线生成多轮轨迹并以执行正确性计算奖励。
-
-```bash
-python -m grpo.prepare --config configs/grpo_balanced_binary_512_seed42.yaml
-python -m grpo.train --config configs/grpo_balanced_binary_512_seed42.yaml --max-steps 128
-python -m grpo.status --config configs/grpo_balanced_binary_512_seed42.yaml
-```
-
-训练后可通过 `python -m evaluation.run_eval` 重新生成评测记录。旧版轨迹包含已经删除的 `sample_rows`、`submit` 工具，不能直接作为当前接口的训练数据。
-
-## Qwen2.5-Coder-3B `<tool>` 多轮评测
-
-`evaluation.run_tool_xml` 是独立的可恢复评测入口，不改写历史评测结果。它在首轮提供完整 schema；每次助手回复必须是 `<reasoning>...</reasoning>` 加一个 `<tool>{"name":"...","arguments":{...}}</tool>`。`list_tables`、`inspect_tables`、`inspect_values`、`execute_sql` 和最终 `submit_sql` 使用同一格式。每次工具执行后返回 `<observation>`，其中包含 `turns_remaining`；探索最多 10 次，提交另占一次。模型生成在 `</tool>` 截止，防止自行编造工具结果。评测使用贪心解码和本仓库的 `ExecutionVerifier`，不是 SQL-Trail 作者的官方评测器。
-
-有 GPU 后先启动 OpenAI-compatible 的 vLLM 服务，再从仓库根目录运行：
-
-```bash
-python -m evaluation.run_tool_xml \
-  --endpoint http://127.0.0.1:8004 \
-  --model /root/autodl-tmp/Qwen2.5-Coder-3B-Instruct \
-  --task-file data/external_dev.jsonl \
-  --env-config configs/env_sql_planner_qwen25_coder_3b.yaml \
-  --spider-root /root/autodl-tmp/sqlagent/datasets/spider/spider_data
-```
-
-默认输出到 `artifacts/sql_planner/qwen25_coder_3b_base_tool_xml_forced_submit_v4_eval/`，逐题保存轨迹、完整对话并定期更新 `summary.json`。同一配置重启时自动跳过已完成题目；换提示词、模型或数据时应使用新的 `--output-dir`。可先用 `--limit 10` 做小规模检查，但全量评测必须使用新的输出目录。
-
-`tool_xml_direct_aligned_v4_forced_submit` 默认每次生成最多 512 tokens，与历史单轮对照的已记录配置一致；也可通过 `--max-tokens` 调整。问题和 schema 的包装复用仓库单轮提示词构造函数，系统提示保留 `<reasoning>`、`<tool>`，强调直接生成候选 SQL、按明确问题修复、空结果不等于错误。每次工具 observation 后的 user 消息都再次附上完整 schema 和原问题，包括复用起始 SQL 后的第一条 observation。轮数到 0 时，增加一条包含完整 schema 和问题的最终提交提醒，只允许 `submit_sql`。若模型仍输出其他动作或格式不正确，评测器从最后一条尝试提交的 SQL、最后成功执行的 SQL 或原始 SQL 依次选择兜底 SQL，写入 `source: evaluator_fallback` 的单独提交步骤及原因。若从未生成任何 SQL，则兜底为 `SELECT NULL WHERE 0`。原生提交与兜底提交分别记为 `submitted_sql` 和 `forced_submit_sql`。历史单轮运行没有归档完整提示词，因此不声称新提示词与历史请求逐字相同。manifest 保存完整环境配置及解码参数。
-
-要真正从历史单轮答案继续交互，在上述命令中追加：
-
-```bash
---initial-sql-dir artifacts/sql_planner/qwen25_coder_3b_base_direct_full_schema_external_dev_eval \
---output-dir artifacts/sql_planner/qwen25_coder_3b_base_direct_seeded_forced_submit_v4_eval
-```
-
-该模式按 task_id 读取原 SQL，校验数据集哈希并记录候选 SQL 哈希。第一步由程序包装成 `execute_sql`，标记 `source: baseline_replay`，计入一次探索预算且不消耗模型生成 tokens；随后返回真实执行 observation，由模型决定修复或提交。gold SQL 和基线判分不进入对话。它是固定起始答案的干预实验，不是 SQL-Trail 原始流程。
-
-历史 60.06% 来自离线结果重比较，并非上述入口的原始 `ExecutionVerifier` 分数。全量新运行结束后，可用同一重评分脚本比较新多轮结果和旧单轮结果：
-
-```bash
-PYTHONPATH=. python research/sql_trail/audit.py \
-  --multi-run artifacts/sql_planner/qwen25_coder_3b_base_direct_seeded_forced_submit_v4_eval \
-  --output-dir artifacts/sql_planner/qwen25_coder_3b_base_direct_seeded_forced_submit_v4_eval/rescore
-```
-
-该脚本仅使用已保存 SQL，不调用模型，分别报告原评分与官方 `result_eq` 比较函数分数；仍不是完整 test-suite 评测。脚本要求全部 1034 题已完成，且本目录已有 `research/sql_trail/official_exec_eval.py` 来源快照。
-
-## SQL-Planner：自由工具顺序轨迹采集
-
-`sql_planner.collect` 调用 DeepSeek API，初始只提供自然语言问题和五种工具的定义，不预先注入数据库 schema。采集接口提供 `list_tables`、`inspect_tables`、`inspect_values`、`execute_sql` 和 `submit_sql`。`inspect_tables` 接收 1–8 个表名，一次调用返回各表的列、主键和外键；单个表名无效时仅该表返回错误。模型自行决定探索顺序，每次调用后收到真实 SQLite 工具反馈。提示词要求每次模型回复恰好调用一个工具；如果 API 仍返回多个工具调用，采集器将其记为 `multiple_tool_calls` 并停止该轨迹，不执行这一批中的任何调用。最多允许 10 次探索工具调用，另有一次不占探索预算的 `submit_sql`；用满探索预算后，下一次模型回复只能调用 `submit_sql`。模型可以提前提交，提示词要求提前提交前在上一轮成功执行 `execute_sql`，并建议复用该 SQL。采集器不硬性校验提前提交的相邻工具或 SQL 是否相同；调用 `submit_sql` 后执行并用完整结果与标准答案比对。未调用 `submit_sql` 的轨迹不计为正确提交。轨迹保存 `tool_sequence`、探索调用数、每步参数和观察、最终 SQL、正确性、API token 用量及对话消息，方便后续分析调用顺序。此阶段不筛选顺序，也不训练模型。
-
-先运行上面的 Spider 预处理命令生成 `data/train.jsonl`，配置好 `configs/env_sql_planner_qwen25_coder_3b.yaml` 中的 Spider 路径和 Qwen2.5-Coder-3B-Instruct tokenizer 路径，并在环境变量 `DEEPSEEK_API_KEY` 中设置 API 密钥，然后运行；本机可用 `--env-config` 指向本地配置：
-
-```bash
-python -m sql_planner.collect --tasks data/train.jsonl --limit 100 --samples-per-task 3
-```
-
-默认模型为 `deepseek-v4-flash`，结果逐条保存在 `artifacts/sql_planner/multi_table_v11/trajectories/`；同一任务和样本编号已有文件时会跳过，便于中断后续跑。输出目录的 `run_manifest.json` 固定模型、提示、数据与环境配置，参数变化时需使用新的输出目录，避免混合不同实验。`--limit 0` 表示使用全部训练任务。采集只读取训练集，标准 SQL 不会发给 DeepSeek。模型和运行次数会影响 API 费用；可先用较小的 `--limit` 检查记录格式。
-
-若要按 SQL-Trail 的口径，仅对官方 `train_spider.json` 中的 7,000 条题目采集自由工具顺序轨迹，可运行：
-
-```bash
-export DEEPSEEK_API_KEY="<your-api-key>"
-python -m sql_planner.collect_spider_train \
-  --spider-root ../datasets/spider/spider_data \
-  --samples-per-task 1 \
-  --workers 16
-```
-
-该入口不会读取 `train_others.json`，也不会向模型提供 Gold SQL。默认输出目录为 `artifacts/sql_planner/spider_train_7000_multi_table_v11/`，与旧版采集结果分开。模型可以自由选择探索工具，但每次回复只能提出一个调用；探索次数达到上限后，采集器仅提供 `submit_sql`。每条轨迹独立保存，重复运行会跳过已有文件。建议先加 `--limit 100 --workers 4` 做小规模连通性与费用检查，再运行全部 7,000 条。
-
-`evaluation.run_reasoning_sft` 在每轮 user 输入末尾显示剩余轮数（包含本轮及最终提交轮）和剩余探索轮数。默认 10 轮探索加 1 轮最终提交，显示剩余轮数从 11 递减至 1；最后一轮追加「这是最后一轮。请在此轮使用submit_sql工具提交SQL。」并调用模型。若最后一轮没有合法提交，不再执行探索工具，而是兜底提交 `last_executed_sql`。选择的是最后一次尝试执行的 SQL，不要求其执行成功；仍通过相同的数据库验证器判分。若没有执行过 SQL且模型也未提交，则记录 `missing_submission`，不生成占位 SQL。提前正常提交不受影响，预算耗尽前的格式错误也不触发该兜底。兜底轨迹记录 `source: evaluator_fallback`、`forced_submission: true`，状态为 `forced_submit_sql`。manifest 中的 `final_submission_policy` 和 `round_prompt_version` 区分新旧评测规则；重评必须使用新的输出目录，不能与原结果混合续跑。此提醒在评测时动态添加，不修改已有训练数据。
+CPU 测试包含实际 SQLite 工具与执行验证；模型生成和教师请求使用脚本化替身。GPU SFT、GRPO、vLLM 和真实 DeepSeek 调用需在对应运行环境验证，本仓库不以 CPU 单元测试代表真实模型效果。

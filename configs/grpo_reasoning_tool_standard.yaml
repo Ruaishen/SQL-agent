@@ -1,5 +1,5 @@
-student_model: /root/autodl-tmp/sqlagent/sql-agent-rl/artifacts/sql_planner/reasoning_balanced_2000_500_qwen25_coder_3b_sft/checkpoint_epoch_2
-reference_model: /root/autodl-tmp/sqlagent/sql-agent-rl/artifacts/sql_planner/reasoning_balanced_2000_500_qwen25_coder_3b_sft/checkpoint_epoch_2
+student_model: /root/autodl-tmp/sqlagent/sql-agent-rl/artifacts/sft/train/checkpoint_epoch_2
+reference_model: /root/autodl-tmp/sqlagent/sql-agent-rl/artifacts/sft/train/checkpoint_epoch_2
 train_data: /root/autodl-tmp/sql-agent-rl/data/train.jsonl
 output_dir: /root/autodl-tmp/sql-agent-rl/grpo/grpo_reasoning_tool_standard
 seed: 42

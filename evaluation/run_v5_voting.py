@@ -88,7 +88,7 @@ def main(
     model: Annotated[str, typer.Option()],
     task_file: Annotated[Path, typer.Option(exists=True)] = Path("data/external_dev.jsonl"),
     env_config: Annotated[Path, typer.Option(exists=True)] = Path(
-        "configs/env_sql_planner_qwen25_coder_3b.yaml"
+        "configs/env.yaml"
     ),
     spider_root: Annotated[Path | None, typer.Option()] = None,
     source_dir: Annotated[Path, typer.Option(exists=True)] = SOURCE_DIR,

@@ -32,7 +32,7 @@ python -m evaluation.run_tool_xml \
   --endpoint http://127.0.0.1:8004 \
   --model /root/autodl-tmp/Qwen2.5-Coder-3B-Instruct \
   --task-file data/external_dev.jsonl \
-  --env-config configs/env_sql_planner_qwen25_coder_3b.yaml \
+  --env-config configs/env.yaml \
   --spider-root /root/autodl-tmp/sqlagent/datasets/spider/spider_data \
   --single-turn \
   --output-dir "$output_dir" --workers 8 --max-tokens 512
