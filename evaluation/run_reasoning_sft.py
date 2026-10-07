@@ -215,10 +215,16 @@ def main() -> None:
     parser.add_argument("--max-num-seqs", type=int, default=16)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--memory-db", type=Path)
-    parser.add_argument("--memory-top-k", type=int, default=3)
-    parser.add_argument("--memory-max-tokens", type=int, default=1536)
+    parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    parser.add_argument("--embedding-device", default="cpu")
+    parser.add_argument("--embedding-batch-size", type=int, default=8)
+    parser.add_argument("--embedding-max-length", type=int, default=2048)
+    parser.add_argument("--memory-top-k", type=int, default=10)
+    parser.add_argument("--memory-max-tokens", type=int, default=8192)
     args = parser.parse_args()
-    if args.memory_top_k < 0 or args.memory_max_tokens < 1:
+    if args.memory_top_k < 0 or min(
+        args.memory_max_tokens, args.embedding_batch_size, args.embedding_max_length
+    ) < 1:
         parser.error("Invalid memory retrieval limits")
     if args.memory_db and not args.memory_db.is_file():
         parser.error("Memory database does not exist")
@@ -237,7 +243,7 @@ def main() -> None:
     memory_contexts = None
     memory_snapshot = None
     if args.memory_db:
-        from experience_memory.retrieve import contexts_for_tasks
+        from experience_memory.retrieve import EmbeddingEncoder, contexts_for_tasks
         from experience_memory.store import MemoryStore
         from sql_agent.truncation import TokenCounter
 
@@ -251,6 +257,10 @@ def main() -> None:
             top_k=args.memory_top_k,
             max_tokens=args.memory_max_tokens,
             count_tokens=TokenCounter(config.tokenizer_path).count_text,
+            encoder=EmbeddingEncoder(
+                args.embedding_model, device=args.embedding_device,
+                batch_size=args.embedding_batch_size, max_length=args.embedding_max_length,
+            ),
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     records_dir = args.output_dir / "trajectories"
@@ -274,7 +284,11 @@ def main() -> None:
             "snapshot_sha256": memory_snapshot,
             "top_k": args.memory_top_k,
             "max_tokens": args.memory_max_tokens,
-            "retriever": "lexical_v1",
+            "retriever": "embedding_v1",
+            "embedding_model": args.embedding_model,
+            "embedding_device": args.embedding_device,
+            "embedding_batch_size": args.embedding_batch_size,
+            "embedding_max_length": args.embedding_max_length,
         }
     manifest_path = args.output_dir / "manifest.json"
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != eval_manifest:

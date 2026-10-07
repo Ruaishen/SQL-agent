@@ -136,7 +136,7 @@ GRPO 会更新权重，因此如需使用它，应先完成 GRPO，再冻结最�
 
 不在记忆条目中保存正确性标记、模型名、记忆版本、检索 ID、时间、轮次或候选 ID。必要的模型配置和验证证据独立保存在实验记录中。
 
-检索当前采用 `experience` 上的 TF-IDF，命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 3 条，有 token 预算，无匹配则不注入。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
+检索仅使用 `Qwen/Qwen3-Embedding-0.6B` 对原问题和 `experience` 编码，按归一化向量的余弦相似度召回；支持中英文跨语言匹配。命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 10 条、仅取正相似度，记忆上下文预算默认 8192 tokens。Embedding 权重冻结，默认 CPU、batch size 8、编码长度上限 2048 tokens；超长文本编码时截断。首次非空检索下载模型，离线可用 `--embedding-model /path/to/Qwen3-Embedding-0.6B`，GPU 可用 `--embedding-device cuda:0`。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
 
 ```bash
 python -m experience_memory.evolve \
@@ -145,7 +145,7 @@ python -m experience_memory.evolve \
   --spider-root /path/to/spider_data --teacher-model YOUR_DEEPSEEK_MODEL \
   --memory-db artifacts/experience_memory/memories.sqlite \
   --output-dir artifacts/experience_memory/run_001 \
-  --rounds 1 --limit 100 --memory-top-k 3 --memory-max-tokens 1536
+  --rounds 1 --limit 100 --memory-top-k 10 --memory-max-tokens 8192
 ```
 
 整轮结束后追加成功经验，下一轮再使用。详细记录、续跑方式和限制见 `docs/experience_memory.md`。

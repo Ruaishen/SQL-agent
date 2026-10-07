@@ -10,10 +10,15 @@ import pytest
 from evaluation.run_reasoning_sft import evaluate_batch
 from experience_memory.evolve import run_round, write_json
 from experience_memory.reflect import reflect
-from experience_memory.retrieve import render_context, retrieve
+from experience_memory.retrieve import (
+    EmbeddingEncoder,
+    EmbeddingRetriever,
+    render_context,
+    retrieve,
+)
 from experience_memory.store import FIELDS, MemoryStore
-from sql_agent.verifier import ExecutionVerifier
 from sql_agent.deepseek import Completion, DeepSeekClient
+from sql_agent.verifier import ExecutionVerifier
 
 EXPERIENCE = "统计实体数量时，先确认需要统计的实体，检查选取的表与题目是否一致。"
 
@@ -116,8 +121,17 @@ def test_retrieval_text_only_and_budget():
         "source_task_id": "do_not_inject",
     }
     unrelated = {**memory, "experience": "排序结果时检查升序和降序"}
-    assert retrieve("How many entities?", [unrelated, memory]) == [memory]
-    assert retrieve("OLD SQL", [memory]) == []
+    class Encoder:
+        batch_size = 8
+
+        def encode(self, texts, *, is_query):
+            if not is_query:
+                assert texts == [unrelated["experience"], EXPERIENCE]
+                return [[0, 1], [1, 0]]
+            assert texts == ["How many entities?"]
+            return [[1, 0]]
+
+    assert retrieve("How many entities?", [unrelated, memory], encoder=Encoder()) == [memory]
     context = render_context([memory], max_tokens=2000, count_tokens=len)
     assert EXPERIENCE in context and "OLD SQL" in context and "NEW SQL" in context
     assert "do_not_inject" not in context
@@ -248,3 +262,89 @@ def test_round_skips_correct_initial_without_teacher(tmp_path, sample_db, task, 
     )
     assert counts["initial_correct"] == 1 and counts["appended"] == 0
     assert not teacher.messages
+
+
+def test_embedding_batch_cache_cross_language_and_stable_ties():
+    calls = []
+    memories = [{"experience": "按实体去重后计数"}, {"experience": "检查聚合粒度"}]
+
+    class Encoder:
+        batch_size = 1
+
+        def encode(self, texts, *, is_query):
+            calls.append((texts, is_query))
+            return [[2, 0] for _ in texts]
+
+    retriever = EmbeddingRetriever(memories, Encoder())
+    assert retriever.search(["How many unique entities?", "统计唯一实体"], 1) == [
+        [memories[0]], [memories[0]]
+    ]
+    assert retriever.search(["another question"], 2) == [memories]
+    assert sum(not is_query for _, is_query in calls) == 1
+    assert retriever.search(["anything"], 0) == [[]]
+    with pytest.raises(ValueError):
+        retriever.search(["anything"], -1)
+
+
+@pytest.mark.parametrize("values", [[[float("nan"), 1]], [[0, 0]], [[1]], [1, 2]])
+def test_invalid_embeddings_fail_without_lexical_fallback(values):
+    class Encoder:
+        batch_size = 8
+
+        def encode(self, texts, *, is_query):
+            return [[1, 0]] if is_query else values
+
+    with pytest.raises(ValueError):
+        retrieve("question", [{"experience": "advice"}], encoder=Encoder())
+
+
+def test_embedding_encoder_freezes_model_and_uses_last_token(monkeypatch):
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    captured = []
+
+    class Batch(dict):
+        def to(self, device):
+            return self
+
+    class Tokenizer:
+        def __call__(self, texts, **kwargs):
+            captured.append((texts, kwargs))
+            return Batch(input_ids=torch.ones((len(texts), 2), dtype=torch.long))
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, input_ids):
+            assert not torch.is_grad_enabled()
+            return SimpleNamespace(last_hidden_state=torch.tensor(
+                [[[9., 9.], [3., 4.]]] * len(input_ids)
+            ))
+
+    model = Model()
+    loads = []
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: Tokenizer())
+    monkeypatch.setattr(AutoModel, "from_pretrained", lambda *a, **kw: loads.append(kw) or model)
+    encoder = EmbeddingEncoder(batch_size=1)
+    assert torch.allclose(encoder.encode(["经验"], is_query=False), torch.tensor([[.6, .8]]))
+    encoder.encode(["How many?"], is_query=True)
+    assert len(loads) == 1 and not model.training and not model.weight.requires_grad
+    assert captured[0][0] == ["经验"]
+    assert captured[1][0][0].startswith("Instruct:")
+    assert captured[1][0][0].endswith("Query:How many?")
+    assert captured[0][1]["max_length"] == 2048
+
+
+def test_default_embedding_retrieval_takes_ten():
+    memories = [{"experience": str(i)} for i in range(12)]
+
+    class Encoder:
+        batch_size = 8
+
+        def encode(self, texts, *, is_query):
+            return [[1, 0] for _ in texts]
+
+    assert retrieve("question", memories, encoder=Encoder()) == memories[:10]

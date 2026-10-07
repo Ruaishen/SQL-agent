@@ -1,66 +1,110 @@
 from __future__ import annotations
 
-import math
-import re
-from collections import Counter
 from collections.abc import Callable, Iterable
 
-
-def terms(text: str) -> Counter:
-    result = Counter(re.findall(r"[a-z_][a-z_0-9]*", text.lower()))
-    for span in re.findall(r"[\u4e00-\u9fff]+", text):
-        result.update(span[i : i + 2] for i in range(len(span) - 1))
-        if len(span) == 1:
-            result[span] += 1
-    # Bridge common English questions and Chinese teacher experiences.
-    aliases = {
-        "count": ("count", "number", "many", "数量", "计数", "统计"),
-        "join": ("join", "连接", "关联"),
-        "distinct": ("distinct", "unique", "去重", "唯一"),
-        "group": ("group", "each", "每个", "分组", "聚合"),
-        "max": ("max", "highest", "most", "最大", "最高"),
-        "min": ("min", "lowest", "least", "最小", "最低"),
-        "order": ("order", "sort", "排序"),
-    }
-    for concept, words in aliases.items():
-        if any(result[word] for word in words):
-            result["concept:" + concept] += 1
-    return result
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+QUERY_INSTRUCTION = (
+    "Given a natural-language SQL task, retrieve general SQL reasoning experiences "
+    "whose applicability conditions and advice help solve the task."
+)
 
 
-def retrieve(query: str, memories: list[dict], top_k: int = 3) -> list[dict]:
-    """Deterministic TF-IDF cosine search over experience text only."""
-    if top_k < 0:
-        raise ValueError("top_k must be nonnegative")
-    if not memories or top_k == 0:
-        return []
-    documents = [terms(memory["experience"]) for memory in memories]
-    frequencies = Counter(term for document in documents for term in document)
-    weights = {
-        term: math.log((1 + len(documents)) / (1 + count)) + 1
-        for term, count in frequencies.items()
-    }
+class EmbeddingEncoder:
+    """Frozen Qwen3 embedding model; lazy loading keeps empty-memory runs lightweight."""
 
-    def vector(document):
-        return {
-            term: (1 + math.log(count)) * weights[term]
-            for term, count in document.items()
-            if term in weights
-        }
+    def __init__(
+        self, model: str = DEFAULT_EMBEDDING_MODEL, *, device: str = "cpu",
+        batch_size: int = 8, max_length: int = 2048,
+    ):
+        if batch_size < 1 or max_length < 1:
+            raise ValueError("Invalid embedding limits")
+        self.model_name = model
+        self.device = device
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self._model = None
+        self._tokenizer = None
 
-    query_vector = vector(terms(query))
-    query_norm = math.sqrt(sum(weight**2 for weight in query_vector.values()))
-    if not query_norm:
-        return []
-    ranked = []
-    for index, document in enumerate(documents):
-        values = vector(document)
-        norm = math.sqrt(sum(weight**2 for weight in values.values()))
-        score = sum(weight * values.get(term, 0) for term, weight in query_vector.items())
-        if norm and score > 0:
-            ranked.append((score / (norm * query_norm), index))
-    ranked.sort(key=lambda row: (-row[0], row[1]))
-    return [memories[index] for _, index in ranked[:top_k]]
+    def encode(self, texts: list[str], *, is_query: bool):
+        import torch
+        import torch.nn.functional as F
+
+        if self._model is None:
+            from transformers import AutoModel, AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, padding_side="left"
+            )
+            self._model = AutoModel.from_pretrained(
+                self.model_name,
+                torch_dtype=(
+                    torch.float32 if torch.device(self.device).type == "cpu" else torch.float16
+                ),
+            ).to(self.device).eval()
+            self._model.requires_grad_(False)
+        if is_query:
+            texts = [f"Instruct: {QUERY_INSTRUCTION}\nQuery:{text}" for text in texts]
+        embeddings = []
+        with torch.inference_mode():
+            for start in range(0, len(texts), self.batch_size):
+                batch = self._tokenizer(
+                    texts[start:start + self.batch_size], padding=True, truncation=True,
+                    max_length=self.max_length, return_tensors="pt",
+                ).to(self.device)
+                # Official Qwen3 recipe: left padding and last-token pooling.
+                hidden = self._model(**batch).last_hidden_state[:, -1]
+                embeddings.append(F.normalize(hidden.float(), p=2, dim=1).cpu())
+        return torch.cat(embeddings)
+
+
+class EmbeddingRetriever:
+    """Encode a memory snapshot once; search only experience text using cosine similarity."""
+
+    def __init__(self, memories: list[dict], encoder=None):
+        self.memories = memories
+        self.encoder = encoder if encoder is not None else EmbeddingEncoder()
+        self._vectors = None
+
+    def search(self, queries: list[str], top_k: int = 10) -> list[list[dict]]:
+        if top_k < 0:
+            raise ValueError("top_k must be nonnegative")
+        if not queries or not self.memories or top_k == 0:
+            return [[] for _ in queries]
+        import torch
+        import torch.nn.functional as F
+
+        def normalized(vectors, rows):
+            values = torch.as_tensor(vectors, dtype=torch.float32).cpu()
+            if values.ndim != 2 or values.shape[0] != rows or values.shape[1] == 0:
+                raise ValueError("Invalid embedding shape")
+            if not torch.isfinite(values).all() or (values.norm(dim=1) == 0).any():
+                raise ValueError("Invalid embedding values")
+            return F.normalize(values, p=2, dim=1)
+
+        if self._vectors is None:
+            self._vectors = normalized(
+                self.encoder.encode(
+                    [memory["experience"] for memory in self.memories], is_query=False
+                ), len(self.memories),
+            )
+        results = []
+        for start in range(0, len(queries), self.encoder.batch_size):
+            batch = queries[start:start + self.encoder.batch_size]
+            vectors = normalized(self.encoder.encode(batch, is_query=True), len(batch))
+            if vectors.shape[1] != self._vectors.shape[1]:
+                raise ValueError("Query and memory embedding dimensions differ")
+            scores = vectors @ self._vectors.T
+            for row in scores:
+                # Stable ties follow memory insertion order; keep previous positive-score rule.
+                indices = torch.argsort(row, descending=True, stable=True).tolist()
+                results.append([
+                    self.memories[index] for index in indices[:top_k] if row[index] > 0
+                ])
+        return results
+
+
+def retrieve(query: str, memories: list[dict], top_k: int = 10, *, encoder=None) -> list[dict]:
+    return EmbeddingRetriever(memories, encoder).search([query], top_k)[0]
 
 
 HEADER = (
@@ -87,13 +131,14 @@ def render_context(
 
 
 def contexts_for_tasks(
-    tasks, memories: list[dict], *, top_k: int, max_tokens: int, count_tokens: Callable[[str], int]
+    tasks, memories: list[dict], *, top_k: int, max_tokens: int,
+    count_tokens: Callable[[str], int], encoder=None,
 ) -> dict[str, str]:
+    tasks = list(tasks)
+    matches = EmbeddingRetriever(memories, encoder).search(
+        [task.question for task in tasks], top_k
+    )
     return {
-        task.task_id: render_context(
-            retrieve(task.question, memories, top_k),
-            max_tokens=max_tokens,
-            count_tokens=count_tokens,
-        )
-        for task in tasks
+        task.task_id: render_context(found, max_tokens=max_tokens, count_tokens=count_tokens)
+        for task, found in zip(tasks, matches, strict=True)
     }

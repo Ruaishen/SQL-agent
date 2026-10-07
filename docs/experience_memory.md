@@ -38,9 +38,23 @@ SQLite 的 `memories` 表存放 JSON 记录，仅包含：
 
 ## 检索与推理
 
-第一版使用确定性的 TF-IDF 余弦检索，仅索引 `experience`，支持英文词、中文双字片段
-和少量常见 SQL 概念的中英文映射。检索查询使用原问题，默认取最多 3 条。
-没有匹配时不注入。该方案不等同于 embedding 语义检索，跨语言和改写召回仍有限。
+检索只使用冻结的 `Qwen/Qwen3-Embedding-0.6B`（0.6B 参数、1024 维、中英文支持），
+通过现有 `[train]` 依赖中的 Transformers / PyTorch 加载，不需要额外检索库。
+仅编码 `experience`，不编码前后 SQL 或来源字段；原始问题加英文检索任务指令后编码。
+使用左侧 padding、最后 token 的 hidden state 和 L2 归一化，向量点积即余弦相似度。
+每轮记忆快照编码一次，问题分批编码，相同分数按记忆写入顺序排序。
+默认最多 10 条，记忆上下文预算默认 8192 tokens，只取正相似度；未设置经过验证的相关性阈值，语义向量的正值不保证适用。
+不会在推理过程中再次检索。模型加载或编码失败会报错，不回退到词汇匹配。
+
+默认 `--embedding-model Qwen/Qwen3-Embedding-0.6B --embedding-device cpu`，
+`--embedding-batch-size 8 --embedding-max-length 2048`。
+首次非空检索自动下载到 Hugging Face 缓存；离线可传模型本地目录。
+CPU 使用 FP32，GPU 使用 FP16，可通过 `--embedding-device cuda:0` 显式启用。
+0.6B 权重在 FP32 下约 2.4 GB、FP16 下约 1.2 GB，运行还需激活及其他内存。
+编码超过 2048 tokens 的文本会截断，注入的原始经验及 SQL 不因此改变。
+模型和编码配置写入运行清单，变更配置需使用新输出目录；记忆记录字段保持原有格式。
+旧记忆可以直接编码，向量只在运行内缓存；本版不持久化向量索引。
+模型官方说明：https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
 
 检索命中后注入经验以及前后 SQL 示例，提醒学生将历史表名、字段名映射到当前 schema。
 预算按学生 tokenizer 计算；整条经验及例子无法放入预算时跳过，不截断 SQL。
@@ -65,7 +79,7 @@ python -m experience_memory.evolve \
   --memory-db artifacts/experience_memory/memories.sqlite \
   --output-dir artifacts/experience_memory/run_001 \
   --rounds 1 --limit 100 --batch-size 16 \
-  --memory-top-k 3 --memory-max-tokens 1536
+  --memory-top-k 10 --memory-max-tokens 8192
 ```
 
 也可使用安装后的 `sql-agent-memory-evolve` 命令。
@@ -104,7 +118,7 @@ python -m evaluation.run_reasoning_sft \
   --spider-root /path/to/spider_data \
   --output-dir artifacts/experience_memory/holdout_eval \
   --memory-db artifacts/experience_memory/memories.sqlite \
-  --memory-top-k 3 --memory-max-tokens 1536
+  --memory-top-k 10 --memory-max-tokens 8192
 ```
 
 不传 `--memory-db` 即原来的无记忆推理。该评测命令只读取记忆，不反思或新增条目。

@@ -11,7 +11,11 @@ from pathlib import Path
 
 from evaluation.schema import render_schema
 from experience_memory.reflect import reflect
-from experience_memory.retrieve import contexts_for_tasks
+from experience_memory.retrieve import (
+    DEFAULT_EMBEDDING_MODEL,
+    EmbeddingEncoder,
+    contexts_for_tasks,
+)
 from experience_memory.store import MemoryStore
 from sql_agent.config import EnvConfig
 from sql_agent.data import load_tasks
@@ -56,10 +60,11 @@ def run_round(
     config: EnvConfig,
     store: MemoryStore,
     output_dir: Path,
-    top_k: int = 3,
-    memory_max_tokens: int = 1536,
+    top_k: int = 10,
+    memory_max_tokens: int = 8192,
     teacher_max_tokens: int = 1024,
     batch_size: int = 16,
+    embedding_encoder=None,
 ) -> dict:
     """student(tasks, contexts) starts fresh episodes with the fixed checkpoint."""
     if batch_size < 1 or top_k < 0 or memory_max_tokens < 1:
@@ -68,6 +73,7 @@ def run_round(
         raise ValueError("Memory construction accepts only train tasks")
     if len({task.task_id for task in tasks}) != len(tasks):
         raise ValueError("Duplicate tasks")
+    embedding_encoder = embedding_encoder or EmbeddingEncoder()
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_manifest(
         output_dir / "round_manifest.json",
@@ -82,6 +88,11 @@ def run_round(
             "top_k": top_k,
             "memory_max_tokens": memory_max_tokens,
             "teacher_max_tokens": teacher_max_tokens,
+            "retriever": "embedding_v1",
+            "embedding_model": embedding_encoder.model_name,
+            "embedding_device": embedding_encoder.device,
+            "embedding_max_length": embedding_encoder.max_length,
+            "embedding_batch_size": embedding_encoder.batch_size,
         },
     )
     snapshot_path = output_dir / "memory_snapshot.json"
@@ -98,6 +109,7 @@ def run_round(
         top_k=top_k,
         max_tokens=memory_max_tokens,
         count_tokens=counter.count_text,
+        encoder=embedding_encoder,
     )
 
     def paths(task):
@@ -228,8 +240,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--teacher-max-tokens", type=int, default=1024)
-    parser.add_argument("--memory-top-k", type=int, default=3)
-    parser.add_argument("--memory-max-tokens", type=int, default=1536)
+    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    parser.add_argument("--embedding-device", default="cpu")
+    parser.add_argument("--embedding-batch-size", type=int, default=8)
+    parser.add_argument("--embedding-max-length", type=int, default=2048)
+    parser.add_argument("--memory-top-k", type=int, default=10)
+    parser.add_argument("--memory-max-tokens", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.82)
     args = parser.parse_args()
     if (
@@ -239,6 +255,8 @@ def main() -> None:
             args.max_tokens,
             args.teacher_max_tokens,
             args.memory_max_tokens,
+            args.embedding_batch_size,
+            args.embedding_max_length,
         )
         < 1
         or min(args.limit, args.memory_top_k) < 0
@@ -288,6 +306,10 @@ def main() -> None:
         )
         teacher = DeepSeekClient(api_key, model=args.teacher_model, base_url=args.teacher_base_url)
         store = MemoryStore(args.memory_db)
+        embedding_encoder = EmbeddingEncoder(
+            args.embedding_model, device=args.embedding_device,
+            batch_size=args.embedding_batch_size, max_length=args.embedding_max_length,
+        )
 
         def student(batch, contexts):
             return evaluate_batch(
@@ -306,6 +328,7 @@ def main() -> None:
                 memory_max_tokens=args.memory_max_tokens,
                 teacher_max_tokens=args.teacher_max_tokens,
                 batch_size=args.batch_size,
+                embedding_encoder=embedding_encoder,
             )
             print(json.dumps({"round": index, **result}), flush=True)
             if result["errors"]:
