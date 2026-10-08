@@ -11,12 +11,15 @@ from evaluation.run_reasoning_sft import evaluate_batch
 from experience_memory.evolve import run_round, write_json
 from experience_memory.reflect import reflect
 from experience_memory.retrieve import (
+    BM25Retriever,
     EmbeddingEncoder,
     EmbeddingRetriever,
+    SqlMemoryRetriever,
     render_context,
     retrieve,
 )
-from experience_memory.store import FIELDS, MemoryStore
+from experience_memory.store import FIELDS, MemoryStore, first_executed_sql
+from experience_memory.backfill_first_sql import backfill_first_sql
 from sql_agent.deepseek import Completion, DeepSeekClient
 from sql_agent.verifier import ExecutionVerifier
 
@@ -56,6 +59,8 @@ def test_append_reexecutes_and_stores_only_requested_fields(tmp_path, sample_db,
     assert not store.append_verified(**arguments)
     (record,) = store.all()
     assert set(record) == FIELDS
+    assert record["question"] == task.question
+    assert record["experience"] == EXPERIENCE
     assert record["sql_before"] == "SELECT count(*) FROM departments"
     assert record["sql_after"] == task.reference_sql
     # Equal experiences from another evidence pair remain independent records.
@@ -115,18 +120,20 @@ def test_admission_rejects_invalid_evidence(case, tmp_path, sample_db, task, con
 
 def test_retrieval_text_only_and_budget():
     memory = {
+        "question": "How many distinct entities?",
         "experience": EXPERIENCE,
         "sql_before": "OLD SQL",
         "sql_after": "NEW SQL",
         "source_task_id": "do_not_inject",
     }
-    unrelated = {**memory, "experience": "排序结果时检查升序和降序"}
+    unrelated = {**memory, "question": "Which entities come first?",
+                 "experience": "排序结果时检查升序和降序"}
     class Encoder:
         batch_size = 8
 
         def encode(self, texts, *, is_query):
             if not is_query:
-                assert texts == [unrelated["experience"], EXPERIENCE]
+                assert texts == [unrelated["question"], memory["question"]]
                 return [[0, 1], [1, 0]]
             assert texts == ["How many entities?"]
             return [[1, 0]]
@@ -156,12 +163,42 @@ class Teacher:
         ("length", None),
         ("stop", "not json"),
         ("stop", '{"experience":"ok","sql":"SELECT 1"}'),
+        ("stop", '{"experience":"ok","type":"json_object","sql":"SELECT 1"}'),
+        ("stop", '{"experience":"ok","type":"other"}'),
         ("stop", '{"experience":""}'),
     ],
 )
 def test_bad_reflections_are_rejected(task, finish_reason, content):
     with pytest.raises(ValueError):
         reflect(Teacher(finish_reason, content), task=task, schema="schema", initial={})
+
+
+def test_flash_response_format_marker_is_ignored(task):
+    teacher = Teacher(content=json.dumps({"experience": EXPERIENCE, "type": "json_object"}))
+    result = reflect(teacher, task=task, schema="schema", initial={})
+    assert result["experience"] == EXPERIENCE
+    assert json.loads(result["teacher_response"]["content"])["type"] == "json_object"
+
+
+def test_reflection_reasks_for_strict_json_without_accepting_extra_fields(task):
+    class CorrectingTeacher:
+        def __init__(self):
+            self.calls = []
+
+        def complete_reflection(self, messages, **kwargs):
+            self.calls.append(json.loads(json.dumps(messages)))
+            payload = ({"experience": "invalid candidate", "analysis_of_existing_experience": "extra"}
+                       if len(self.calls) == 1 else {"experience": EXPERIENCE})
+            return Completion({"content": json.dumps(payload)}, "stop", None, None, {})
+
+    teacher = CorrectingTeacher()
+    result = reflect(teacher, task=task, schema="schema", initial={})
+    assert len(teacher.calls) == 2
+    assert teacher.calls[-1][-1]["role"] == "user"
+    assert "只有 experience 一个字段" in teacher.calls[-1][-1]["content"]
+    assert result["experience"] == EXPERIENCE
+    assert len(result["teacher_attempts"]) == 2
+    assert json.loads(result["teacher_response"]["content"]) == {"experience": EXPERIENCE}
 
 
 def test_reflection_api_uses_json_without_tool_stop_markers(monkeypatch):
@@ -266,7 +303,8 @@ def test_round_skips_correct_initial_without_teacher(tmp_path, sample_db, task, 
 
 def test_embedding_batch_cache_cross_language_and_stable_ties():
     calls = []
-    memories = [{"experience": "按实体去重后计数"}, {"experience": "检查聚合粒度"}]
+    memories = [{"question": "Count distinct entities", "experience": "按实体去重后计数"},
+                {"question": "Aggregate by entity", "experience": "检查聚合粒度"}]
 
     class Encoder:
         batch_size = 1
@@ -295,7 +333,7 @@ def test_invalid_embeddings_fail_without_lexical_fallback(values):
             return [[1, 0]] if is_query else values
 
     with pytest.raises(ValueError):
-        retrieve("question", [{"experience": "advice"}], encoder=Encoder())
+        retrieve("question", [{"question": "source", "experience": "advice"}], encoder=Encoder())
 
 
 def test_embedding_encoder_freezes_model_and_uses_last_token(monkeypatch):
@@ -338,8 +376,8 @@ def test_embedding_encoder_freezes_model_and_uses_last_token(monkeypatch):
     assert captured[0][1]["max_length"] == 2048
 
 
-def test_default_embedding_retrieval_takes_ten():
-    memories = [{"experience": str(i)} for i in range(12)]
+def test_default_embedding_retrieval_takes_five():
+    memories = [{"question": str(i), "experience": str(i)} for i in range(12)]
 
     class Encoder:
         batch_size = 8
@@ -347,4 +385,369 @@ def test_default_embedding_retrieval_takes_ten():
         def encode(self, texts, *, is_query):
             return [[1, 0] for _ in texts]
 
-    assert retrieve("question", memories, encoder=Encoder()) == memories[:10]
+    assert retrieve("question", memories, encoder=Encoder()) == memories[:5]
+
+
+def test_tfidf_retrieval_uses_full_experience_only():
+    memories = [
+        {"experience": "原始问题：COUNT employees\n通用经验：检查去重", "sql_after": "SUM salary"},
+        {"experience": "原始问题：SUM salary\n通用经验：检查聚合", "sql_after": "COUNT employees"},
+    ]
+    assert retrieve("count EMPLOYEES", memories, retriever="tfidf") == [memories[0]]
+    assert retrieve("salary", memories, retriever="tfidf") == [memories[1]]
+    assert retrieve("去重", memories, retriever="tfidf") == [memories[0]]
+
+
+def test_tfidf_no_overlap_limits_and_stable_ties():
+    memories = [{"experience": "same query"} for _ in range(7)]
+    assert retrieve("same", memories, retriever="tfidf") == memories[:5]
+    assert retrieve("same", memories, top_k=2, retriever="tfidf") == memories[:2]
+    assert retrieve("unknown", memories, retriever="tfidf") == []
+    assert retrieve("same", memories, top_k=0, retriever="tfidf") == []
+    assert retrieve("same", [], retriever="tfidf") == []
+    with pytest.raises(ValueError):
+        retrieve("same", memories, top_k=-1, retriever="tfidf")
+
+
+def test_tfidf_never_loads_embedding(monkeypatch):
+    monkeypatch.setattr(
+        "experience_memory.retrieve.EmbeddingEncoder",
+        lambda *args, **kwargs: pytest.fail("TF-IDF must not load an embedding model"),
+    )
+    memory = {"experience": "rare query"}
+    assert retrieve("rare", [memory], retriever="tfidf") == [memory]
+
+
+def test_tfidf_smoothed_idf_and_l2_cosine():
+    import math
+
+    from experience_memory.retrieve import TfidfRetriever
+
+    retriever = TfidfRetriever([{"experience": "common rare rare"}, {"experience": "common"}])
+    rare_idf = 1 + math.log(3 / 2)
+    assert retriever.idf == {"common": 1, "rare": rare_idf}
+    expected_norm = math.sqrt(1 + (2 * rare_idf) ** 2)
+    assert retriever.vectors[0]["rare"] == pytest.approx(2 * rare_idf / expected_norm)
+    assert retriever._vector({"rare": 1, "unseen": 100}) == {"rare": 1}
+
+
+def test_separated_question_keeps_student_context_identical():
+    memory = {"question": "Full original question?", "experience": "General advice",
+              "sql_before": "SELECT 1", "sql_after": "SELECT 2"}
+    old = {key: value for key, value in memory.items() if key != "question"}
+    old["experience"] = "原始问题：Full original question?\n通用经验：General advice"
+    assert render_context([memory], max_tokens=1000, count_tokens=len) == render_context(
+        [old], max_tokens=1000, count_tokens=len
+    )
+
+
+def test_question_retrieval_rejects_missing_question():
+    with pytest.raises(ValueError, match="question"):
+        retrieve("question", [{"experience": "advice"}])
+
+
+@pytest.mark.parametrize("top_k", [5, 10])
+def test_sql_tfidf_top_k_scores_and_stable_order(top_k, monkeypatch):
+    monkeypatch.setattr("experience_memory.retrieve.EmbeddingEncoder",
+                        lambda *args, **kwargs: pytest.fail("SQL TF-IDF must not load embeddings"))
+    memories = [{"memory_id": str(i), "question": "unindexed_question",
+                 "experience": "unindexed_advice", "sql_before": "SELECT SUM(salary) FROM employees",
+                 "sql_after": "SELECT COUNT(*) FROM departments"} for i in range(12)]
+    retriever = SqlMemoryRetriever(memories, retriever="tfidf", top_k=top_k,
+                                  max_tokens=10000, count_tokens=len)
+    retriever.prepare()
+    assert "unindexed_advice" not in retriever.retriever.idf
+    assert "departments" not in retriever.retriever.idf
+    result, empty = retriever(["SELECT SUM(salary) FROM employees", "unindexed_advice"])
+    assert result["memory_ids"] == [str(i) for i in range(top_k)]
+    assert result["scores"] == pytest.approx([1.0] * top_k)
+    assert result["query_sql"] == "SELECT SUM(salary) FROM employees"
+    assert result["context"].count("修改前 SQL：") == top_k
+    assert empty["memory_ids"] == [] and empty["scores"] == [] and empty["context"] == ""
+
+
+def test_sql_tfidf_uses_before_sql_instead_of_question_or_experience():
+    memories = [
+        {"memory_id": "a", "question": "count departments", "experience": "count departments",
+         "sql_before": "SELECT SUM(salary) FROM employees", "sql_after": "SELECT COUNT(*) FROM departments"},
+        {"memory_id": "b", "question": "sum salary employees", "experience": "sum salary employees",
+         "sql_before": "SELECT COUNT(*) FROM departments", "sql_after": "SELECT SUM(salary) FROM employees"},
+    ]
+    retriever = SqlMemoryRetriever(memories, retriever="tfidf", top_k=1,
+                                  max_tokens=10000, count_tokens=len)
+    result, = retriever(["SELECT SUM(salary) FROM employees"])
+    assert result["memory_ids"] == ["a"]
+    assert result["scores"] == pytest.approx([1.0])
+
+
+def test_sql_retrieval_indexes_before_sql_and_preserves_scores():
+    memories = [{"memory_id": "a", "question": "source", "experience": "advice",
+                 "sql_before": "SELECT wrong", "sql_after": "SELECT right"}]
+    calls = []
+
+    class Encoder:
+        batch_size = 8
+
+        def encode(self, texts, *, is_query):
+            calls.append((texts, is_query))
+            return [[1, 0] for _ in texts]
+
+    retriever = SqlMemoryRetriever(memories, Encoder(), top_k=5, max_tokens=1000,
+                                  count_tokens=len)
+    retriever.prepare()
+    (result,) = retriever(["SELECT candidate"])
+    assert calls == [(["SELECT wrong"], False), (["SELECT candidate"], True)]
+    assert result["query_sql"] == "SELECT candidate"
+    assert result["memory_ids"] == ["a"] and result["scores"] == [1.0]
+    assert "advice" in result["context"]
+
+
+@pytest.mark.parametrize("failed_first", [False, True])
+@pytest.mark.parametrize("requires_success", [False, True])
+@pytest.mark.parametrize("retrieval_backend", ["stub", "tfidf", "bm25"])
+def test_memory_is_injected_after_first_successful_execute_only(
+    task, config, sample_db, monkeypatch, failed_first, requires_success, retrieval_backend,
+):
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
+        SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs)
+    ))
+    wrong = "SELECT count(*) FROM departments"
+    actions = ([("execute_sql", "SELECT * FROM nonexistent")] if failed_first else [])
+    actions += [("execute_sql", wrong), ("execute_sql", task.reference_sql),
+                ("submit_sql", task.reference_sql)]
+    inputs = []
+    calls = []
+    marker = "MEMORY_AFTER_FIRST_TRIGGER"
+    sql_retriever = SqlMemoryRetriever(
+        [{"memory_id": "a", "experience": marker, "sql_before": wrong,
+          "sql_after": "SELECT historical_example"}],
+        retriever=retrieval_backend, top_k=5, max_tokens=10000, count_tokens=len,
+    ) if retrieval_backend != "stub" else None
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            inputs.append(json.loads(json.dumps(messages)))
+            return json.dumps(messages)
+
+    class LLM:
+        def generate(self, prompts, params, **kwargs):
+            name, sql = actions[len(inputs) - 1]
+            text = "<reasoning>Inspect result.</reasoning><tool>" + json.dumps(
+                {"name": name, "arguments": {"sql": sql}}
+            ) + "</tool>"
+            return [SimpleNamespace(outputs=[SimpleNamespace(text=text, finish_reason="stop")])]
+
+    def callback(sqls):
+        calls.append(sqls)
+        if sql_retriever is not None:
+            return sql_retriever(sqls)
+        return [{"query_sql": sql, "context": marker, "memory_ids": ["a"],
+                 "scores": [0.5]} for sql in sqls]
+
+    (result,) = evaluate_batch([task], LLM(), Tokenizer(), "system", config, 512,
+                               execute_sql_memory=callback,
+                               execute_sql_memory_requires_success=requires_success)
+    trigger = int(failed_first and requires_success)
+    trigger_sql = actions[trigger][1]
+    assert calls == [[trigger_sql]]
+    assert all(marker not in json.dumps(messages) for messages in inputs[:trigger + 1])
+    assert marker in json.dumps(inputs[trigger + 1])
+    assert marker not in json.dumps(result["initial_messages"])
+    assert result["turns"][trigger]["observation"]["status"] == (
+        "error" if failed_first and not requires_success else "success")
+    assert result["memory_retrieval"]["query_sql"] == trigger_sql
+    assert sum("memory_retrieval" in turn for turn in result["turns"]) == 1
+    assert result["correct"] is True
+
+
+def test_no_execute_sql_means_no_retrieval(task, config, sample_db, monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
+        SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs)
+    ))
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return json.dumps(messages)
+
+    class LLM:
+        def generate(self, prompts, params, **kwargs):
+            text = "<reasoning>Submit.</reasoning><tool>" + json.dumps(
+                {"name": "submit_sql", "arguments": {"sql": task.reference_sql}}
+            ) + "</tool>"
+            return [SimpleNamespace(outputs=[SimpleNamespace(text=text, finish_reason="stop")])]
+
+    (record,) = evaluate_batch([task], LLM(), Tokenizer(), "system", config, 512,
+                               execute_sql_memory=lambda sqls: pytest.fail("No successful SQL"))
+    assert record["correct"] and record["memory_retrieval"] is None
+
+
+@pytest.mark.parametrize("failed_first", [False, True])
+@pytest.mark.parametrize("empty_second_retrieval", [False, True])
+def test_retrieve_on_every_execute_from_second_including_errors(
+    task, config, sample_db, monkeypatch, failed_first, empty_second_retrieval,
+):
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
+        SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs)
+    ))
+    first = "SELECT * FROM nonexistent" if failed_first else "SELECT count(*) FROM departments"
+    actions = [
+        ("execute_sql", {"sql": first}), ("list_tables", {}),
+        ("execute_sql", {"sql": "SELECT * FROM nonexistent"}),
+        ("inspect_tables", {"table_names": ["employees"]}),
+        ("execute_sql", {"sql": task.reference_sql}),
+        ("submit_sql", {"sql": task.reference_sql}),
+    ]
+    inputs, calls = [], []
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            inputs.append(json.loads(json.dumps(messages)))
+            return json.dumps(messages)
+
+    class LLM:
+        def generate(self, prompts, params, **kwargs):
+            name, arguments = actions[len(inputs) - 1]
+            text = "<reasoning>Inspect.</reasoning><tool>" + json.dumps(
+                {"name": name, "arguments": arguments}
+            ) + "</tool>"
+            return [SimpleNamespace(outputs=[SimpleNamespace(text=text, finish_reason="stop")])]
+
+    def callback(sqls):
+        calls.append(sqls)
+        context = "" if empty_second_retrieval and len(calls) == 1 else f"MEMORY_PASS_{len(calls)}"
+        return [{"query_sql": sql, "context": context, "memory_ids": ["a"] if context else [],
+                 "scores": [0.5] if context else []} for sql in sqls]
+
+    (record,) = evaluate_batch([task], LLM(), Tokenizer(), "system", config, 512,
+                               execute_sql_memory=callback,
+                               execute_sql_memory_requires_success=False,
+                               execute_sql_memory_start_index=2,
+                               execute_sql_memory_repeat=True)
+    assert calls == [["SELECT * FROM nonexistent"], [task.reference_sql]]
+    assert record["turns"][2]["observation"]["status"] == "error"
+    assert [r["execute_index"] for r in record["memory_retrievals"]] == [2, 3]
+    assert [r["turn_index"] for r in record["memory_retrievals"]] == [2, 4]
+    assert all("MEMORY_PASS" not in json.dumps(m) for m in inputs[:3])
+    if not empty_second_retrieval:
+        assert "MEMORY_PASS_1" in json.dumps(inputs[3])
+    assert "MEMORY_PASS_1" not in json.dumps(inputs[5])
+    assert "MEMORY_PASS_2" in json.dumps(inputs[5])
+    assert record["correct"] is True
+
+
+@pytest.mark.parametrize("top_k", [5, 10])
+def test_sql_bm25_scores_limits_and_indexed_field(top_k, monkeypatch):
+    import math
+
+    monkeypatch.setattr("experience_memory.retrieve.EmbeddingEncoder",
+                        lambda *args, **kwargs: pytest.fail("BM25 must not load embeddings"))
+    memories = [{"memory_id": str(i), "question": "unindexed_question",
+                 "experience": "unindexed_advice", "sql_before": "SELECT salary FROM employees",
+                 "sql_after": "SELECT COUNT(*) FROM departments"} for i in range(12)]
+    retriever = SqlMemoryRetriever(memories, retriever="bm25", top_k=top_k,
+                                  max_tokens=10000, count_tokens=len)
+    retriever.prepare()
+    result, empty = retriever(["SELECT salary FROM employees", "departments unindexed_advice"])
+    assert result["memory_ids"] == [str(i) for i in range(top_k)]
+    assert result["scores"] == pytest.approx([4 * math.log(1 + 0.5 / 12.5)] * top_k)
+    assert result["context"].count("修改前 SQL：") == top_k
+    assert empty["memory_ids"] == [] and empty["context"] == ""
+
+
+def test_bm25_term_saturation_length_normalization_and_query_terms():
+    import math
+
+    memories = [{"sql_before": "rare rare common"}, {"sql_before": "common filler filler filler filler"}]
+    retriever = BM25Retriever(memories)
+    matches, repeated = retriever.search(["rare", "RARE rare"], return_scores=True)
+    expected = math.log(2) * 2 * 2.5 / (2 + 1.5 * (0.25 + 0.75 * 3 / 4))
+    assert len(matches) == 1 and matches[0]["score"] == pytest.approx(expected)
+    assert repeated == matches
+    common, = retriever.search(["common"], return_scores=True)
+    assert common[0]["memory"] == memories[0]
+    assert common[0]["score"] > common[1]["score"]
+    assert retriever.search(["unknown"], 0) == [[]]
+    assert BM25Retriever([]).search(["rare"]) == [[]]
+    assert BM25Retriever([{"sql_before": "!!!"}]).search(["rare"]) == [[]]
+    with pytest.raises(ValueError, match="top_k"):
+        retriever.search(["rare"], -1)
+    with pytest.raises(ValueError, match="sql_before"):
+        BM25Retriever([{"experience": "advice"}])
+
+
+@pytest.mark.parametrize("kwargs", [{"k1": 0}, {"b": -1}, {"b": 2}, {"k1": float("nan")}])
+def test_bm25_rejects_invalid_parameters(kwargs):
+    with pytest.raises(ValueError, match="BM25"):
+        BM25Retriever([], **kwargs)
+
+
+def test_first_executed_sql_includes_errors_and_ignores_unexecuted_calls():
+    trajectory = {"final_sql": "SELECT final", "turns": [
+        {"tool": "execute_sql", "arguments": {"sql": "SELECT unexecuted"}},
+        {"tool": "execute_sql", "arguments": {"sql": "SELECT * FROM missing"},
+         "observation": {"status": "error", "error_type": "sql_error"}},
+        {"tool": "execute_sql", "arguments": {"sql": "SELECT 1"},
+         "observation": {"status": "success"}},
+    ]}
+    assert first_executed_sql(trajectory) == "SELECT * FROM missing"
+    assert first_executed_sql({"final_sql": "SELECT final", "turns": []}) is None
+
+
+def test_backfill_and_new_admission_preserve_first_sql(tmp_path, sample_db, task, config):
+    import sqlite3
+
+    task = replace(task, split="train")
+    database = tmp_path / "mem.sqlite"
+    store = MemoryStore(database)
+    initial_path, retry_path = setup_evidence(tmp_path, task)
+    initial = json.loads(initial_path.read_text())
+    initial["turns"] = [{"tool": "execute_sql", "arguments": {"sql": "SELECT first"},
+                         "observation": {"status": "error"}}]
+    write_json(initial_path, initial)
+    arguments = dict(task=task, experience=EXPERIENCE, initial_path=initial_path,
+                     retry_path=retry_path, verifier=ExecutionVerifier(sample_db, task.reference_sql, config))
+    assert store.append_verified(**arguments)
+    record, = store.all()
+    assert record["sql_first_execute"] == "SELECT first"
+    legacy = {k: v for k, v in record.items() if k != "sql_first_execute"}
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE memories SET record = ?", (json.dumps(legacy),))
+    assert store.all() == [legacy]
+    assert not store.append_verified(**arguments)
+    assert store.all() == [legacy]
+    output = tmp_path / "memories.jsonl"
+    assert backfill_first_sql(database, output) == {
+        "total": 1, "updated": 1, "with_first_execute_sql": 1, "without_execute_sql": 0}
+    assert store.all() == [record]
+    assert json.loads(output.read_text()) == record
+    assert backfill_first_sql(database, output)["updated"] == 0
+    initial["turns"][0]["arguments"]["sql"] = "SELECT changed"
+    write_json(initial_path, initial)
+    with pytest.raises(ValueError, match="disagrees"):
+        backfill_first_sql(database, output)
+    assert store.all() == [record]
+
+
+
+@pytest.mark.parametrize("backend", ["tfidf", "bm25"])
+def test_first_execute_sql_index_excludes_missing_and_never_uses_final(backend):
+    memories = [
+        {"memory_id": "a", "sql_first_execute": "SELECT salary FROM employees",
+         "sql_before": "SELECT albums FROM records", "sql_after": "SELECT fixed", "experience": "advice"},
+        {"memory_id": "b", "sql_first_execute": "SELECT albums FROM records",
+         "sql_before": "SELECT salary FROM employees", "sql_after": "SELECT fixed", "experience": "advice"},
+        {"memory_id": "c", "sql_first_execute": None, "sql_before": "SELECT unique_missing",
+         "sql_after": "SELECT fixed", "experience": "advice"},
+        {"memory_id": "d", "sql_before": "SELECT legacy_missing",
+         "sql_after": "SELECT fixed", "experience": "advice"},
+    ]
+    retriever = SqlMemoryRetriever(memories, retriever=backend, text_field="sql_first_execute",
+                                   top_k=1, max_tokens=10000, count_tokens=len)
+    assert retriever.indexed_memory_count == 2
+    assert retriever.excluded_missing_sql_count == 2
+    match, absent = retriever(["SELECT salary FROM employees", "unique_missing legacy_missing"])
+    assert match["memory_ids"] == ["a"]
+    assert absent["memory_ids"] == []
+    empty = SqlMemoryRetriever(memories[2:], retriever=backend, text_field="sql_first_execute",
+                               top_k=10, max_tokens=10000, count_tokens=len)
+    assert empty(["SELECT 1"])[0]["context"] == ""

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from sft.train import collate_samples, epoch_order, learning_rate_at_step, masked_ce_sum
+from sft.train import (
+    collate_samples,
+    epoch_order,
+    learning_rate_at_step,
+    masked_ce_sum,
+    micro_batch_for_samples,
+)
 from sft.train_config import SftTrainConfig
 
 
@@ -52,3 +58,19 @@ def test_learning_rate_warms_up_then_cosine_decays(tmp_path) -> None:
     assert learning_rate_at_step(config, 1, 10) == config.learning_rate / 2
     assert learning_rate_at_step(config, 2, 10) == config.learning_rate
     assert learning_rate_at_step(config, 10, 10) == 0.0
+
+
+def test_micro_batch_recovers_after_long_sequences(tmp_path) -> None:
+    config = SftTrainConfig(
+        tmp_path, tmp_path, tmp_path, micro_batch_size=8, micro_batch_max_tokens=12000
+    )
+    long_batch = [{"input_ids": torch.zeros(5890)}, {"input_ids": torch.zeros(5100)}]
+    short_batch = [{"input_ids": torch.zeros(1225)}]
+    assert micro_batch_for_samples(long_batch, config, 8) == 2
+    assert micro_batch_for_samples(short_batch, config, 2) == 8
+    assert micro_batch_for_samples([{"input_ids": torch.zeros(13000)}], config, 8) == 1
+
+
+def test_micro_batch_without_token_budget_preserves_oom_backoff(tmp_path) -> None:
+    config = SftTrainConfig(tmp_path, tmp_path, tmp_path, micro_batch_size=8)
+    assert micro_batch_for_samples([{"input_ids": torch.zeros(10)}], config, 2) == 2

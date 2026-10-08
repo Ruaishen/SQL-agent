@@ -60,7 +60,7 @@ def run_round(
     config: EnvConfig,
     store: MemoryStore,
     output_dir: Path,
-    top_k: int = 10,
+    top_k: int = 5,
     memory_max_tokens: int = 8192,
     teacher_max_tokens: int = 1024,
     batch_size: int = 16,
@@ -88,7 +88,7 @@ def run_round(
             "top_k": top_k,
             "memory_max_tokens": memory_max_tokens,
             "teacher_max_tokens": teacher_max_tokens,
-            "retriever": "embedding_v1",
+            "retriever": "embedding_question_v1",
             "embedding_model": embedding_encoder.model_name,
             "embedding_device": embedding_encoder.device,
             "embedding_max_length": embedding_encoder.max_length,
@@ -244,7 +244,7 @@ def main() -> None:
     parser.add_argument("--embedding-device", default="cpu")
     parser.add_argument("--embedding-batch-size", type=int, default=8)
     parser.add_argument("--embedding-max-length", type=int, default=2048)
-    parser.add_argument("--memory-top-k", type=int, default=10)
+    parser.add_argument("--memory-top-k", type=int, default=5)
     parser.add_argument("--memory-max-tokens", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.82)
     args = parser.parse_args()
@@ -304,35 +304,40 @@ def main() -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_num_seqs=args.batch_size,
         )
-        teacher = DeepSeekClient(api_key, model=args.teacher_model, base_url=args.teacher_base_url)
-        store = MemoryStore(args.memory_db)
-        embedding_encoder = EmbeddingEncoder(
-            args.embedding_model, device=args.embedding_device,
-            batch_size=args.embedding_batch_size, max_length=args.embedding_max_length,
-        )
-
-        def student(batch, contexts):
-            return evaluate_batch(
-                batch, llm, tokenizer, prompt, config, args.max_tokens, memory_contexts=contexts
+        try:
+            teacher = DeepSeekClient(api_key, model=args.teacher_model, base_url=args.teacher_base_url)
+            store = MemoryStore(args.memory_db)
+            embedding_encoder = EmbeddingEncoder(
+                args.embedding_model, device=args.embedding_device,
+                batch_size=args.embedding_batch_size, max_length=args.embedding_max_length,
             )
 
-        for index in range(1, args.rounds + 1):
-            result = run_round(
-                tasks=tasks,
-                student=student,
-                teacher=teacher,
-                config=config,
-                store=store,
-                output_dir=args.output_dir / f"round_{index:03d}",
-                top_k=args.memory_top_k,
-                memory_max_tokens=args.memory_max_tokens,
-                teacher_max_tokens=args.teacher_max_tokens,
-                batch_size=args.batch_size,
-                embedding_encoder=embedding_encoder,
-            )
-            print(json.dumps({"round": index, **result}), flush=True)
-            if result["errors"]:
-                raise RuntimeError("Round has errors; resolve them and resume before later rounds")
+            def student(batch, contexts):
+                return evaluate_batch(
+                    batch, llm, tokenizer, prompt, config, args.max_tokens, memory_contexts=contexts
+                )
+
+            for index in range(1, args.rounds + 1):
+                result = run_round(
+                    tasks=tasks,
+                    student=student,
+                    teacher=teacher,
+                    config=config,
+                    store=store,
+                    output_dir=args.output_dir / f"round_{index:03d}",
+                    top_k=args.memory_top_k,
+                    memory_max_tokens=args.memory_max_tokens,
+                    teacher_max_tokens=args.teacher_max_tokens,
+                    batch_size=args.batch_size,
+                    embedding_encoder=embedding_encoder,
+                )
+                print(json.dumps({"round": index, **result}), flush=True)
+                if result["errors"]:
+                    raise RuntimeError("Round has errors; resolve them and resume before later rounds")
+        finally:
+            # Explicitly close model workers before multiprocessing's exit handler,
+            # including when a failed teacher request keeps a traceback alive.
+            llm.llm_engine.engine_core.shutdown()
 
 
 if __name__ == "__main__":

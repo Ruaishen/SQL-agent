@@ -132,11 +132,11 @@ GRPO 会更新权重，因此如需使用它，应先完成 GRPO，再冻结最�
 
 候选经验不提前进入正式库。写入时读取两次记录，要求正确性严格分别为 false 和 true，再重新执行两条 SQL 验证。重试须由学生实际提交，评测器兜底提交不满足入库条件。超时、Gold 异常和没有最终 SQL 的失败跳过。
 
-每条记忆只保存：`memory_id`、`experience`、`sql_before`、`sql_after`、`source_task_id`、`source_split`、`initial_record_path`、`retry_record_path`。标题含义、适用条件和改进建议写成一个 `experience` 字段；全部为通用经验，不设数据库专属条目。修改后 SQL 来自学生成功重试。
+每条记忆只保存：`memory_id`、`question`、`experience`、`sql_before`、`sql_after`、`source_task_id`、`source_split`、`initial_record_path`、`retry_record_path`。`question` 保存完整来源问题原文，`experience` 只保存标题含义、适用条件和改进建议；默认只编码 `question` 召回，检索上下文仍包含原题和经验。不设数据库专属条目。修改后 SQL 来自学生成功重试。
 
 不在记忆条目中保存正确性标记、模型名、记忆版本、检索 ID、时间、轮次或候选 ID。必要的模型配置和验证证据独立保存在实验记录中。
 
-检索仅使用 `Qwen/Qwen3-Embedding-0.6B` 对原问题和 `experience` 编码，按归一化向量的余弦相似度召回；支持中英文跨语言匹配。命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 10 条、仅取正相似度，记忆上下文预算默认 8192 tokens。Embedding 权重冻结，默认 CPU、batch size 8、编码长度上限 2048 tokens；超长文本编码时截断。首次非空检索下载模型，离线可用 `--embedding-model /path/to/Qwen3-Embedding-0.6B`，GPU 可用 `--embedding-device cuda:0`。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
+默认检索使用 `Qwen/Qwen3-Embedding-0.6B` 对待解问题和记忆的 `question` 编码，按归一化向量的余弦相似度召回；支持中英文跨语言匹配。命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 5 条、仅取正相似度，记忆上下文预算默认 8192 tokens。Embedding 权重冻结，默认 CPU、batch size 8、编码长度上限 2048 tokens；超长文本编码时截断。首次非空检索下载模型，离线可用 `--embedding-model /path/to/Qwen3-Embedding-0.6B`，GPU 可用 `--embedding-device cuda:0`。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
 
 ```bash
 python -m experience_memory.evolve \
@@ -145,7 +145,7 @@ python -m experience_memory.evolve \
   --spider-root /path/to/spider_data --teacher-model YOUR_DEEPSEEK_MODEL \
   --memory-db artifacts/experience_memory/memories.sqlite \
   --output-dir artifacts/experience_memory/run_001 \
-  --rounds 1 --limit 100 --memory-top-k 10 --memory-max-tokens 8192
+  --rounds 1 --limit 100 --memory-top-k 5 --memory-max-tokens 8192
 ```
 
 整轮结束后追加成功经验，下一轮再使用。详细记录、续跑方式和限制见 `docs/experience_memory.md`。

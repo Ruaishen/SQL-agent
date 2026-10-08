@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -164,7 +165,7 @@ class DeepSeekClient:
                     time.sleep(min(2**attempt, 8))
                     continue
                 raise DeepSeekAPIError(f"DeepSeek HTTP {exc.code}") from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
                     continue

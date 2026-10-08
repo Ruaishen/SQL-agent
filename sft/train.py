@@ -186,6 +186,13 @@ def update_with_oom_backoff(student, optimizer, samples, pad_token_id, config, m
     raise AssertionError("unreachable")
 
 
+def micro_batch_for_samples(samples, config: SftTrainConfig, previous: int) -> int:
+    if not config.micro_batch_max_tokens:
+        return previous
+    longest = max(sample["input_ids"].numel() for sample in samples)
+    return min(config.micro_batch_size, max(1, config.micro_batch_max_tokens // longest))
+
+
 def train(
     config: SftTrainConfig, *, max_steps: int | None, save: bool,
     epoch_callback: Callable[[int, Path, Any, Any], None] | None = None,
@@ -241,13 +248,14 @@ def train(
             for group in optimizer.param_groups:
                 group["lr"] = lr
             batch = ordered[start : start + config.effective_batch_size]
+            requested_micro_batch = micro_batch_for_samples(batch, config, current_micro_batch)
             update = update_with_oom_backoff(
                 student,
                 optimizer,
                 batch,
                 tokenizer.pad_token_id,
                 config,
-                current_micro_batch,
+                requested_micro_batch,
             )
             current_micro_batch = int(update["micro_batch_size"])
             elapsed = time.monotonic() - started
@@ -267,6 +275,7 @@ def train(
                 ).isoformat(timespec="seconds"),
                 "peak_gpu_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
                 "peak_gpu_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
+                "requested_micro_batch_size": requested_micro_batch,
                 **update,
             }
             with metrics_path.open("a", encoding="utf-8") as handle:

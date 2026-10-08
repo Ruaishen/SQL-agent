@@ -10,14 +10,31 @@ from sql_agent.verifier import ExecutionVerifier
 
 FIELDS = {
     "memory_id",
+    "question",
     "experience",
     "sql_before",
+    "sql_first_execute",
     "sql_after",
     "source_task_id",
     "source_split",
     "initial_record_path",
     "retry_record_path",
 }
+
+
+def first_executed_sql(trajectory: dict) -> str | None:
+    """First observed SQL execution, including SQL errors; never use final_sql as fallback."""
+    for turn in trajectory.get("turns", []):
+        observation = turn.get("observation")
+        if turn.get("tool") != "execute_sql" or not isinstance(observation, dict):
+            continue
+        if observation.get("error_type") in {"context_limit", "exploration_budget_exhausted"}:
+            continue
+        sql = turn.get("arguments", {}).get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("Executed SQL evidence has no SQL text")
+        return sql
+    return None
 
 
 class MemoryStore:
@@ -37,8 +54,11 @@ class MemoryStore:
             rows = connection.execute("SELECT record FROM memories ORDER BY rowid").fetchall()
         records = [json.loads(row[0]) for row in rows]
         for record in records:
-            if set(record) != FIELDS:
+            if not (FIELDS - {"question", "sql_first_execute"} <= set(record) <= FIELDS):
                 raise ValueError("Memory contains unexpected fields")
+            first_sql = record.get("sql_first_execute")
+            if first_sql is not None and (not isinstance(first_sql, str) or not first_sql.strip()):
+                raise ValueError("Invalid sql_first_execute")
         return records
 
     def append_verified(
@@ -85,8 +105,10 @@ class MemoryStore:
         )
         record = {
             "memory_id": "mem_" + hashlib.sha256(identity.encode()).hexdigest(),
+            "question": task.question,
             "experience": experience.strip(),
             "sql_before": before,
+            "sql_first_execute": first_executed_sql(initial),
             "sql_after": after,
             "source_task_id": task.task_id,
             "source_split": task.split,
@@ -100,7 +122,12 @@ class MemoryStore:
                 "SELECT record FROM memories WHERE memory_id = ?", (record["memory_id"],)
             ).fetchone()
             if existing:
-                if existing[0] != serialized:
+                existing_record = json.loads(existing[0])
+                candidate = dict(record)
+                # Legacy snapshots stay byte-for-byte unchanged until explicit backfill.
+                if "sql_first_execute" not in existing_record:
+                    candidate.pop("sql_first_execute")
+                if existing_record != candidate:
                     raise ValueError("Existing evidence identity has different content")
                 return False
             connection.execute(

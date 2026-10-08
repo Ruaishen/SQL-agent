@@ -16,6 +16,7 @@ class SftTrainConfig:
     epochs: int = 2
     effective_batch_size: int = 64
     micro_batch_size: int = 16
+    micro_batch_max_tokens: int = 0
     max_sequence_tokens: int = 16384
     learning_rate: float = 5e-6
     warmup_steps: int = 5
@@ -45,6 +46,8 @@ class SftTrainConfig:
             raise ValueError("epochs and batch sizes must be positive")
         if self.micro_batch_size > self.effective_batch_size:
             raise ValueError("micro_batch_size cannot exceed effective_batch_size")
+        if self.micro_batch_max_tokens < 0:
+            raise ValueError("micro_batch_max_tokens must be nonnegative")
         if self.max_sequence_tokens < 2:
             raise ValueError("max_sequence_tokens must be at least two")
         if self.learning_rate <= 0 or self.gradient_clip_norm <= 0:

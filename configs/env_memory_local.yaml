@@ -1,0 +1,5 @@
+spider_root: /root/autodl-tmp/sqlagent/datasets/spider/spider_data
+processed_data_root: /root/autodl-tmp/sqlagent/sql-agent-rl/data
+tokenizer_path: /root/autodl-tmp/Qwen2.5-Coder-3B-Instruct
+max_turns: 10
+max_context_tokens: 16384
