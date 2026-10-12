@@ -53,7 +53,8 @@ def make_pair(loser: dict, winner: dict) -> dict:
             "pairing_mode": "full_original_vs_gold_regeneration"}
 
 
-def build(original: Path, regenerated: Path, tasks, config, output: Path, *, workers: int = 1) -> dict:
+def build(original: Path, regenerated: Path, tasks, config, output: Path, *, workers: int = 1,
+          strict_submission: bool = True) -> dict:
     from sft.curate_reasoning import EXTERNAL_REFERENCE, validate_record
     from sql_agent.env import SQLAgentEnv
 
@@ -86,7 +87,8 @@ def build(original: Path, regenerated: Path, tasks, config, output: Path, *, wor
         try:
             pair = make_pair(loser, winner)
             # Reuse SFT's real tool replay, Gold comparison and final verification.
-            validate_record(winner, registry[task_id], config, regenerated=True)
+            validate_record(winner, registry[task_id], config, regenerated=True,
+                            strict_submission=strict_submission)
             for message in pair["rejected_messages"][2::2]:
                 reasoning = message["content"].split("</reasoning>", 1)[0]
                 if EXTERNAL_REFERENCE.search(reasoning):
@@ -119,7 +121,8 @@ def build(original: Path, regenerated: Path, tasks, config, output: Path, *, wor
         raise ValueError(f"No eligible preference pairs: {skipped}")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("".join(json.dumps(p, ensure_ascii=False) + "\n" for p in pairs), encoding="utf-8")
-    report = {"pairs": len(pairs), "skipped": skipped, "source_kind": "SFT verified/audited full regeneration"}
+    report = {"pairs": len(pairs), "skipped": skipped, "source_kind": "SFT verified/audited full regeneration",
+              "submission_validation": "strict_tested_gold" if strict_submission else "live_execution_result_equivalence"}
     output.with_suffix(".report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 

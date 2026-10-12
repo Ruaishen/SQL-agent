@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -35,12 +36,20 @@ def make_json_safe(value: Any) -> Any:
     return value
 
 
+@lru_cache(maxsize=4)
+def _load_tokenizer(path: str, mtime_ns: int, size: int) -> Tokenizer:
+    # The file signature invalidates cached instances after tokenizer updates.
+    # Shared instances are used only for immutable encoding, never reconfigured.
+    return Tokenizer.from_file(path)
+
+
 class TokenCounter:
     def __init__(self, tokenizer_path: Path):
         tokenizer_file = tokenizer_path / "tokenizer.json"
         if not tokenizer_file.is_file():
             raise FileNotFoundError(f"Tokenizer file does not exist: {tokenizer_file}")
-        self._tokenizer = Tokenizer.from_file(str(tokenizer_file))
+        signature = tokenizer_file.stat()
+        self._tokenizer = _load_tokenizer(str(tokenizer_file.resolve()), signature.st_mtime_ns, signature.st_size)
 
     def count_text(self, text: str) -> int:
         return len(self._tokenizer.encode(text, add_special_tokens=False).ids)

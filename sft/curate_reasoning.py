@@ -27,7 +27,8 @@ EXTERNAL_REFERENCE = re.compile(
 )
 
 
-def validate_record(record: dict, task, config: EnvConfig, *, regenerated: bool) -> dict:
+def validate_record(record: dict, task, config: EnvConfig, *, regenerated: bool,
+                    strict_submission: bool = True) -> dict:
     if task.split != "train" or record.get("correct") is not True:
         raise ValueError("Expected an execution-correct training example")
     if record.get("question") != task.question or record.get("db_id") != task.db_id:
@@ -72,7 +73,7 @@ def validate_record(record: dict, task, config: EnvConfig, *, regenerated: bool)
                     raise ValueError("Missing final student submission")
                 sql = action["arguments"]["sql"]
                 previous = turns[index - 1]
-                if regenerated and (
+                if regenerated and strict_submission and (
                     previous["tool"] != "execute_sql"
                     or previous["arguments"].get("sql") != sql
                     or previous["observation"].get("status") != "success"
@@ -80,7 +81,7 @@ def validate_record(record: dict, task, config: EnvConfig, *, regenerated: bool)
                     raise ValueError(
                         "Submission must immediately follow successful identical execution"
                     )
-                if not any(
+                if strict_submission and not any(
                     prior["tool"] == "execute_sql"
                     and prior["arguments"].get("sql") == sql
                     and prior["observation"].get("status") == "success"
@@ -89,7 +90,7 @@ def validate_record(record: dict, task, config: EnvConfig, *, regenerated: bool)
                     raise ValueError("Final SQL lacks a successful matching execution")
                 if sql != record.get("final_sql"):
                     raise ValueError("Final SQL field differs from submitted SQL")
-                if regenerated and sql != task.reference_sql:
+                if regenerated and strict_submission and sql != task.reference_sql:
                     raise ValueError("Regeneration must preserve the exact Gold SQL string")
                 observation, _ = env.submit_sql(action["arguments"])
                 if not observation.get("verification", {}).get("correct"):

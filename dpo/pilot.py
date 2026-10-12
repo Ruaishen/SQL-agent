@@ -123,6 +123,7 @@ def run(args):
                 "thinking": args.generation_mode, "audit_thinking": "enabled",
                 "reasoning_effort": "high" if args.generation_mode == "enabled" else None,
                 "temperature": args.temperature if args.generation_mode == "disabled" else None,
+                "validation_workers": getattr(args, "validation_workers", 1),
                 "max_tokens": args.max_tokens})
     print(json.dumps({"model": model, "scheduled": len(tasks), "workers": args.workers}), flush=True)
     outcomes = []
@@ -182,7 +183,8 @@ def run(args):
         if pairs_path.exists():
             paired = read_json(pairs_path.with_suffix(".report.json"))
         else:
-            paired = build(args.output / "original", args.output / "regenerated", tasks, config, pairs_path, workers=args.workers)
+            paired = build(args.output / "original", args.output / "regenerated", tasks, config, pairs_path,
+                           workers=getattr(args, "validation_workers", 1))
     usage = Counter()
     for result in outcomes:
         usage.update(result.get("usage", {}))
@@ -210,8 +212,9 @@ def main():
     parser.add_argument("--model")
     parser.add_argument("--generation-mode", choices=("enabled", "disabled"), default="enabled")
     parser.add_argument("--temperature", type=float, default=0.3)
+    parser.add_argument("--validation-workers", type=int, default=1)
     args = parser.parse_args()
-    if min(args.count, args.workers, args.max_tokens) < 1:
+    if min(args.count, args.workers, args.max_tokens, args.validation_workers) < 1:
         parser.error("Parameters must be positive")
     if args.mode == "prepare" and (args.spider_root is None or args.tokenizer is None):
         parser.error("Preparation requires Spider root and tokenizer")
