@@ -1,6 +1,6 @@
-# SQL Agent：SFT、GRPO 与记忆自进化
+# SQL Agent：SFT、DPO、GRPO 与记忆自进化
 
-基于 Spider 1.0 的多轮 Text-to-SQL 项目。当前主线是：构造完整推理与工具轨迹 → SFT → 可选 GRPO → 冻结最终模型权重 → 只追加经学生重试验证的经验记忆。
+基于 Spider 1.0 的多轮 Text-to-SQL 项目。当前主线是：构造完整推理与工具轨迹 → SFT → 可选 DPO / GRPO → 冻结最终模型权重 → 只追加经学生重试验证的经验记忆。
 
 ## 项目结构
 
@@ -8,6 +8,7 @@
 |---|---|
 | `sql_agent/` | 只读 SQLite 环境、工具、执行验证器、公共提示词与解析器、DeepSeek 客户端 |
 | `sft/` | 原始轨迹采集、Gold 辅助完整重生成、筛选、学生 tokenizer 转换和 SFT 训练 |
+| `dpo/` | 完整轨迹偏好配对、固定样本生成、特定实验恢复、参考分数缓存与 DPO 训练 |
 | `grpo/` | 保留的在线 Binary GRPO 与 reasoning/tool rollout |
 | `experience_memory/` | 通用经验检索、教师反思、学生重试、成功入库和多轮续跑 |
 | `evaluation/` | 学生推理与评测、基线对照和历史评测辅助工具 |
@@ -16,7 +17,7 @@
 
 已移除 SQL-Planner 包、其命令与专属测试，以及旧 DPO 相关入口。被 SFT、GRPO 和记忆流程共同使用的能力迁入公共模块。历史 `artifacts/sql_planner/` 数据保留，目录名属于历史产物路径，新运行推荐使用 `artifacts/sft/` 和 `artifacts/experience_memory/`。
 
-新增完整轨迹 DPO：原始无 Gold 的错误轨迹作为 `y_l`，复用 SFT 的 Gold 引导生成、执行验证和外部答案泄露审核得到 `y_w`，再进行完整 assistant 轨迹偏好训练。实现位于 `dpo/`，流程与命令见 [完整轨迹 DPO](docs/dpo_full_trajectory.md)。
+当前完整轨迹 DPO 实现位于 `dpo/`，与已移除的旧入口独立。数据构造、训练及恢复规则见下文；目标公式和详细说明见 [完整轨迹 DPO](docs/dpo_full_trajectory.md)。
 
 ## 环境和数据划分
 
@@ -107,6 +108,85 @@ python -m sft.train_status --config configs/sft_reasoning.yaml
 先修改 `configs/sft_reasoning.yaml` 中的学生模型路径。使用学生 tokenizer 和 chat template 转换，完整轨迹的所有 assistant reasoning/action 轮参与监督；system、user、工具 observation 不计算目标 loss。现有训练器按轨迹的监督 token 数归一化，避免长轨迹仅因长度获得更大权重。
 
 旧分叉 Gold 修复的后缀监督规则不进入新数据主线。数据转换拒绝旧 `gold_repair` 后缀记录，并对序列长度、提示词一致性和训练划分做检查。SFT 阶段更新模型权重；训练结束后选择 checkpoint，再进入冻结权重阶段。
+
+## 完整轨迹 DPO（可选阶段）
+
+DPO 使用同一 system prompt 和原问题组成偏好对，训练完整多轮 assistant 轨迹：
+
+- `rejected`（`y_l`）：原始采集时未提供 Gold 的错误轨迹。配对时重新执行最终 SQL，已正确的样本不作为负例；缺少最终 SQL 时，仅接受原始 `invalid_format` 失败。
+- `chosen`（`y_w`）：复用 SFT 的 Gold 辅助重生成，从原问题开始，保留真实 reasoning、工具动作和执行反馈；要求最终执行正确且外部答案泄露审核为 `accept`。
+
+两条分支的工具路径、轮数和 observation 可以不同；教师 Gold 提示、私有 `reasoning_content` 和 API 记录不进入训练消息。审核还检查相对原轨迹的 assistant token 数、工具次数和推理风格变化，统计及差值保存在 `trajectory_comparison`。只处理匹配的训练任务，保留来源路径及 SHA-256，并将配对拒绝原因写入 `.report.json`。审核通过表示满足当前审核规则，仍需抽查数据。
+
+### 构造偏好对
+
+以下命令在仓库根目录执行；先替换 Spider、模型和 tokenizer 路径，并配置 `configs/env.yaml`。原始目录须包含 `trajectories/*.json`。生成和审核会调用 DeepSeek API，常规入口从环境变量 `DEEPSEEK_API_KEY` 读取密钥。
+
+```bash
+# 1. 从原始错题重新生成 chosen，复用 SFT 验证和审核。
+python -m sft.regenerate_reasoning \
+  --source data/reasoning --tasks data/train.jsonl \
+  --env-config configs/env.yaml --spider-root /path/to/spider_data \
+  --model deepseek-flash --output-dir artifacts/dpo/gold_regenerated
+
+# 2. 回放 chosen 的工具轨迹并复核 rejected，保存完整偏好对。
+python -m dpo.pairs \
+  --original data/reasoning --regenerated artifacts/dpo/gold_regenerated \
+  --tasks data/train.jsonl --env-config configs/env.yaml \
+  --spider-root /path/to/spider_data --output artifacts/dpo/pairs.jsonl
+```
+
+常规重生成默认 thinking enabled/high，每题最多 3 次尝试；已有接受结果会跳过。配对默认采用严格提交验证：成功执行与 Gold 字符串完全相同的 SQL 后，立即提交相同 SQL，并验证完整结果。
+
+固定随机样本实验可使用 `dpo.pilot`：
+
+```bash
+python -m dpo.pilot prepare \
+  --source data/reasoning --spider-root /path/to/spider_data \
+  --tokenizer /path/to/sft-checkpoint --env-config configs/env.yaml \
+  --output artifacts/dpo/pilot_100 --count 100 --seed 42
+python -m dpo.pilot run \
+  --output artifacts/dpo/pilot_100 --model deepseek-flash \
+  --generation-mode disabled --temperature 0.3 \
+  --workers 4 --validation-workers 4 --max-tokens 8192
+```
+
+`prepare` 固定样本、源文件哈希和运行配置；它按原轨迹的 `split=train` 选题，再从 Spider 原始文件恢复任务，因此应先核对来源划分与评测集隔离。`run` 支持 enabled/disabled 两种生成模式，审核仍使用 thinking/high，每题仅一次生成尝试。已完成结果可复用，已有尝试但缺少结果的任务记为 `interrupted_attempt`，不自动增加尝试次数。结果、私有 API 记录、token 用量和保留比例分别写入运行目录；密钥缺失时交互输入。
+
+### 特定实验的恢复验证
+
+`dpo/recover.py` 当前是固定路径的实验脚本，读取 `artifacts/dpo/nonthinking_full1907_20261012/失败原因复查.json`，要求选中 87 个已有正确提交和 60 个待继续案例，写入新的 `artifacts/dpo/recovery147_20261012/`。这些数量是脚本的选择断言，不代表最终接受或保留数量；实际结果以生成的 `report.json` 为准。
+
+恢复时回放已有工具前缀并比对保存的 observation；已有正确提交直接验证，待继续案例从保存的响应继续真实执行。候选仍须通过静态检查与独立泄露审核。配对调用 `build(..., strict_submission=False)`，放宽 Gold 精确字符串和紧邻执行要求，但仍检查公开消息与工具记录一致、提交 SQL 与 `final_sql` 一致，以及完整执行结果正确。报告以 `live_execution_result_equivalence` 标明此验证方式。
+
+该脚本需要已有实验文件和交互输入 API 密钥；通用 `dpo.pairs` 命令仍采用严格验证，未提供恢复模式的命令行开关。
+
+### Tokenization、参考缓存与训练
+
+```bash
+# 3. 使用目标 SFT checkpoint 的 tokenizer 构造两条独立完整分支。
+python -m dpo.prepare \
+  --pairs artifacts/dpo/pairs.jsonl --model /path/to/sft-checkpoint \
+  --output artifacts/dpo/tokenized --max-tokens 16384
+
+# 4. 从同一 SFT checkpoint 缓存冻结参考模型分数。
+python -m dpo.train reference \
+  --checkpoint /path/to/sft-checkpoint --dataset artifacts/dpo/tokenized \
+  --reference-dir artifacts/dpo/reference --device cuda
+
+# 5. 全参数 DPO 训练。
+python -m dpo.train train \
+  --checkpoint /path/to/sft-checkpoint --dataset artifacts/dpo/tokenized \
+  --reference-dir artifacts/dpo/reference --output artifacts/dpo/run1 \
+  --beta 0.1 --epochs 1 --batch-size 4 --learning-rate 1e-6 \
+  --gradient-checkpointing --device cuda
+```
+
+仅 assistant 的 reasoning、工具动作和消息结束 token 参与 DPO 分数；system、问题和工具观察作为上下文。分支分数为所有 assistant token 的 log-probability 之和，不按长度平均；超出上下文限制会报错，不静默截断。
+
+参考模型和策略从同一 SFT checkpoint 初始化，参考分数先缓存，训练时仅加载策略模型。训练器先计算完整分支分数，再逐回合重算并反传 DPO 梯度，关闭 dropout；`--batch-size` 表示每次更新累计的偏好对数。缓存与训练核对 tokenizer、数据分片哈希及 checkpoint 文件清单、大小和修改时间，缓存完成后应保持 checkpoint 不变。
+
+配对、tokenization、参考缓存和训练要求新的输出路径。当前训练支持单设备、梯度检查点和梯度裁剪，不提供多卡或中断续训入口；输出 `metrics.jsonl`、训练 `manifest.json` 和最终 `checkpoint/`。完成 DPO 后再冻结最终权重进入记忆自进化，DPO 训练本身不调用记忆新增流程。
 
 ## GRPO（保留的可选阶段）
 
