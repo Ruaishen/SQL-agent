@@ -16,9 +16,36 @@ from sql_agent.data import load_tasks
 from sql_agent.deepseek import DeepSeekClient
 from sql_agent.env import SQLAgentEnv
 from sql_agent.protocol import parse_tagged_response
-from sql_agent.truncation import canonical_json
+from sql_agent.truncation import TokenCounter, canonical_json
 
 PROMPTS = Path(__file__).parent / "prompts"
+
+
+def trajectory_profile(messages: list[dict], counter: TokenCounter) -> dict:
+    public = messages[2:]
+    tool_calls = 0
+    style = []
+    for message in public:
+        if message.get("role") != "assistant":
+            continue
+        try:
+            reasoning, _ = parse_tagged_response(message["content"])
+            tool_calls += 1
+            if len(style) < 3 and not EXTERNAL_REFERENCE.search(reasoning):
+                style.append(reasoning[:240])
+        except ValueError:
+            pass
+    return {
+        "total_tokens": sum(counter.count_text(m["content"]) for m in public if m["role"] == "assistant"),
+        "tool_calls": tool_calls,
+        "reasoning_style_examples": style,
+    }
+
+
+def trajectory_comparison(original: dict, generated: dict) -> dict:
+    return {"original": original, "generated": generated,
+            "differences": {key: generated[key] - original[key] for key in ("total_tokens", "tool_calls")},
+            "ratios": {key: generated[key] / original[key] if original[key] else None for key in ("total_tokens", "tool_calls")}}
 
 
 class RegenerationError(ValueError):
@@ -27,7 +54,8 @@ class RegenerationError(ValueError):
         self.record = record
 
 
-def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int = 8192) -> dict:
+def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int = 8192,
+               thinking: bool = True, temperature: float = 0.3) -> dict:
     if task.split != "train" or source.get("correct") is not False:
         raise ValueError("Regeneration requires a failed training example")
     if source.get("question") != task.question or source.get("db_id") != task.db_id:
@@ -37,10 +65,12 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
         raise ValueError("Missing original SFT system prompt")
     supplement = (PROMPTS / "gold_repair_supplement_zh.md").read_text(encoding="utf-8")
     audit_prompt = (PROMPTS / "external_answer_leak_audit_zh.md").read_text(encoding="utf-8")
+    counter = TokenCounter(config.tokenizer_path)
+    original_profile = trajectory_profile(source["messages"], counter)
     student = [dict(base), {"role": "user", "content": task.question}]
     teacher = [
         dict(base),
-        {"role": "user", "content": supplement.replace("{gold_sql}", task.reference_sql)},
+        {"role": "user", "content": supplement.replace("{original_profile}", json.dumps(original_profile, ensure_ascii=False)).replace("{gold_sql}", task.reference_sql)},
         dict(student[1]),
     ]
     turns, calls = [], []
@@ -51,7 +81,10 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
         if not env.verify(task.reference_sql).correct:
             raise ValueError("Gold SQL failed preflight")
         for index in range(config.max_turns + 1):
-            completion = client.complete_thinking_text(teacher, max_tokens=max_tokens)
+            if thinking:
+                completion = client.complete_thinking_text(teacher, max_tokens=max_tokens, stop_at_tool=True)
+            else:
+                completion = client.complete_text(teacher, max_tokens=max_tokens, temperature=temperature)
             calls.append(
                 {
                     "message": completion.message,
@@ -59,10 +92,9 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
                     "finish_reason": completion.finish_reason,
                 }
             )
-            if completion.finish_reason != "stop" or not completion.message.get(
-                "reasoning_content"
-            ):
-                raise ValueError("Teacher must return complete high-effort text")
+            if completion.finish_reason != "stop" or (thinking and not completion.message.get("reasoning_content")):
+                raise ValueError("Teacher must return complete high-effort text" if thinking
+                                 else "Teacher must return complete non-thinking text")
             content = completion.message.get("content", "")
             reasoning, action = parse_tagged_response(content)
             if index == 0 and action["tool"] != "list_tables":
@@ -93,13 +125,10 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
                 )
             student.append({"role": "assistant", "content": content})
             # Teacher receives its private reasoning again; student never does.
-            teacher.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "reasoning_content": completion.message["reasoning_content"],
-                }
-            )
+            teacher_message = {"role": "assistant", "content": content}
+            if thinking:
+                teacher_message["reasoning_content"] = completion.message["reasoning_content"]
+            teacher.append(teacher_message)
             turns.append(
                 {
                     "turn": len(turns) + 1,
@@ -128,6 +157,7 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
     finally:
         env.close()
     verdict = "reject"
+    comparison = trajectory_comparison(original_profile, trajectory_profile(student, counter))
     if not any(EXTERNAL_REFERENCE.search(turn["reasoning"]) for turn in turns):
         audit = client.complete_thinking_text(
             [
@@ -138,6 +168,7 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
                         {
                             "question": task.question,
                             "messages": student,
+                            "trajectory_comparison": comparison,
                         },
                         ensure_ascii=False,
                     ),
@@ -166,7 +197,9 @@ def regenerate(task, source: dict, config: EnvConfig, client, *, max_tokens: int
         "correct": True,
         "sft_eligible": verdict == "accept",
         "leak_audit": verdict,
+        "trajectory_comparison": comparison,
         "generation_mode": "full_regeneration_from_question",
+        "generation_thinking": thinking,
         "messages": student,
         "student_messages": student,
         "turns": turns,

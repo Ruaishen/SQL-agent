@@ -41,9 +41,12 @@ sql-agent-grpo-train = "grpo.train:main"
 sql-agent-grpo-status = "grpo.status:main"
 sql-agent-sql-similarity = "evaluation.sql_similarity:main"
 sql-agent-memory-evolve = "experience_memory.evolve:main"
+sql-agent-dpo-pairs = "dpo.pairs:main"
+sql-agent-dpo-prepare = "dpo.prepare:main"
+sql-agent-dpo-train = "dpo.train:main"
 
 [tool.setuptools.packages.find]
-include = ["sql_agent*", "data*", "evaluation*", "sft*", "grpo*", "third_party*", "experience_memory*"]
+include = ["sql_agent*", "data*", "evaluation*", "sft*", "dpo*", "grpo*", "third_party*", "experience_memory*"]
 
 [tool.setuptools.package-data]
 sft = ["prompts/*.md"]

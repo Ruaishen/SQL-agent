@@ -16,6 +16,8 @@
 
 已移除 SQL-Planner 包、其命令与专属测试，以及旧 DPO 相关入口。被 SFT、GRPO 和记忆流程共同使用的能力迁入公共模块。历史 `artifacts/sql_planner/` 数据保留，目录名属于历史产物路径，新运行推荐使用 `artifacts/sft/` 和 `artifacts/experience_memory/`。
 
+新增完整轨迹 DPO：原始无 Gold 的错误轨迹作为 `y_l`，复用 SFT 的 Gold 引导生成、执行验证和外部答案泄露审核得到 `y_w`，再进行完整 assistant 轨迹偏好训练。实现位于 `dpo/`，流程与命令见 [完整轨迹 DPO](docs/dpo_full_trajectory.md)。
+
 ## 环境和数据划分
 
 ```bash

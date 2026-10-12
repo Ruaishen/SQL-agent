@@ -9,9 +9,10 @@ import pytest
 
 from sft.collect_reasoning import collect_trajectory
 from sft.curate_reasoning import curate, validate_record
-from sft.regenerate_reasoning import regenerate
+from sft.regenerate_reasoning import regenerate, trajectory_profile
 from sql_agent.deepseek import Completion
 from sql_agent.protocol import build_prompt
+from sql_agent.truncation import TokenCounter
 
 
 def response(tool, arguments):
@@ -62,6 +63,51 @@ def source(task):
     }
 
 
+def test_profile_excludes_tool_observation_lengths(config):
+    counter = TokenCounter(config.tokenizer_path)
+    messages = [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": response("list_tables", {})},
+        {"role": "user", "content": "<observation>short</observation>"},
+        {"role": "assistant", "content": response("submit_sql", {"sql": "SELECT 1"})},
+    ]
+    changed = copy.deepcopy(messages)
+    changed[3]["content"] = "<observation>" + "long observation " * 1000 + "</observation>"
+    assert trajectory_profile(messages, counter) == trajectory_profile(changed, counter)
+    assert trajectory_profile(messages, counter)["total_tokens"] == sum(
+        counter.count_text(m["content"]) for m in messages if m["role"] == "assistant"
+    )
+    assert trajectory_profile(messages, counter)["tool_calls"] == 2
+
+
+def test_nonthinking_generation_keeps_thinking_audit(sample_db, config, task):
+    class NonThinkingClient(Client):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.modes = []
+
+        def complete_text(self, messages, **kwargs):
+            self.modes.append("disabled")
+            self.requests.append(copy.deepcopy(messages))
+            assert kwargs["temperature"] == 0.3
+            return Completion({"content": self.responses.popleft()}, "stop", None, None, {})
+
+        def complete_thinking_text(self, messages, **kwargs):
+            self.modes.append("enabled")
+            return super().complete_thinking_text(messages, **kwargs)
+
+    task = replace(task, split="train")
+    client = NonThinkingClient([
+        response("list_tables", {}), response("execute_sql", {"sql": task.reference_sql}),
+        response("submit_sql", {"sql": task.reference_sql}), "accept"])
+    record = regenerate(task, source(task), config, client, thinking=False)
+    assert record["sft_eligible"] and record["generation_thinking"] is False
+    assert client.modes == ["disabled", "disabled", "disabled", "enabled"]
+    assert all("reasoning_content" not in m for m in record["private_teacher_messages"])
+    validate_record(record, task, config, regenerated=True)
+
+
 def test_full_regeneration_private_context_and_public_audit(sample_db, config, task):
     task = replace(task, split="train")
     client = Client(
@@ -80,7 +126,10 @@ def test_full_regeneration_private_context_and_public_audit(sample_db, config, t
     public = json.dumps(record["student_messages"])
     assert "teacher_only_sql" not in public and "PRIVATE_TEACHER_REASONING" not in public
     audit_input = json.loads(client.requests[-1][1]["content"])
-    assert set(audit_input) == {"question", "messages"}
+    assert set(audit_input) == {"question", "messages", "trajectory_comparison"}
+    assert audit_input["trajectory_comparison"]["generated"]["tool_calls"] == 3
+    assert audit_input["trajectory_comparison"]["original"]["tool_calls"] == 0
+    assert "{original_profile}" not in client.requests[0][1]["content"]
     assert audit_input["messages"] == record["student_messages"]
     normalized = validate_record(record, task, config, regenerated=True)
     assert normalized["merged_origin"] == "gold_regeneration"

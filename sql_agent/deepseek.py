@@ -2,11 +2,49 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+
+from sql_agent.protocol import parse_response
+
+
+TRAJECTORY_STOPS = ["</tool>", "</｜｜DSML｜｜ parameter>", "</｜DSML｜ parameter>"]
+DSML_END = re.compile(
+    r"\s*</｜{1,2}DSML｜{1,2} parameter>"
+    r"(?:\s*</｜{1,2}DSML｜{1,2} invoke>)?"
+    r"(?:\s*</｜{1,2}DSML｜{1,2} calls>)?\s*"
+)
+
+
+def normalize_trajectory_completion(completion: Completion) -> Completion:
+    """Repair only a complete valid action with a missing or known DSML ending."""
+    content = completion.message.get("content")
+    if completion.finish_reason != "stop" or not isinstance(content, str):
+        return completion
+    header = re.match(r"\s*<reasoning>(.*?)</reasoning>\s*<tool>", content, re.DOTALL)
+    if header is None:
+        return completion
+    body = content[header.end():]
+    try:
+        _, end = json.JSONDecoder().raw_decode(body.lstrip())
+    except json.JSONDecodeError:
+        return completion
+    start = len(body) - len(body.lstrip())
+    suffix = body[start + end:]
+    if suffix.strip() and DSML_END.fullmatch(suffix) is None:
+        return completion
+    repaired = content[:header.end()] + body[:start + end] + "</tool>"
+    try:
+        parse_response(repaired)
+    except ValueError:
+        return completion
+    return Completion(message={**completion.message, "content": repaired},
+                      finish_reason=completion.finish_reason, request_id=completion.request_id,
+                      model=completion.model, usage=completion.usage)
 
 
 class DeepSeekAPIError(RuntimeError):
@@ -80,25 +118,10 @@ class DeepSeekClient:
                 "temperature": temperature,
                 "max_tokens": max_tokens,
                 "stream": False,
-                "stop": ["</tool>", "</｜｜DSML｜｜ parameter>"],
+                "stop": TRAJECTORY_STOPS,
             }
         )
-        content = completion.message.get("content")
-        if (
-            completion.finish_reason == "stop"
-            and isinstance(content, str)
-            and "<tool>" in content
-            and "</tool>" not in content
-            and content.rstrip().endswith("}")
-        ):
-            return Completion(
-                message={**completion.message, "content": content.rstrip() + "</tool>"},
-                finish_reason=completion.finish_reason,
-                request_id=completion.request_id,
-                model=completion.model,
-                usage=completion.usage,
-            )
-        return completion
+        return normalize_trajectory_completion(completion)
 
     def complete_reflection(
         self,
@@ -120,11 +143,11 @@ class DeepSeekClient:
         )
 
     def complete_thinking_text(
-        self, messages: list[dict[str, Any]], *, max_tokens: int = 8192
+        self, messages: list[dict[str, Any]], *, max_tokens: int = 8192,
+        stop_at_tool: bool = False,
     ) -> Completion:
         """Teacher-only high-effort generation/audit; replay reasoning_content."""
-        return self._request(
-            {
+        payload = {
                 "model": self.model,
                 "messages": messages,
                 "thinking": {"type": "enabled"},
@@ -132,7 +155,10 @@ class DeepSeekClient:
                 "max_tokens": max_tokens,
                 "stream": False,
             }
-        )
+        if stop_at_tool:
+            payload["stop"] = TRAJECTORY_STOPS
+        completion = self._request(payload)
+        return normalize_trajectory_completion(completion) if stop_at_tool else completion
 
     def _request(self, payload: dict[str, Any]) -> Completion:
         request = urllib.request.Request(

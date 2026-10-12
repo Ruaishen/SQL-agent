@@ -6,7 +6,11 @@ import json
 import unittest
 from unittest.mock import patch
 
-from sql_agent.deepseek import DeepSeekAPIError, DeepSeekClient
+from sql_agent.deepseek import (
+    Completion, DeepSeekAPIError, DeepSeekClient, TRAJECTORY_STOPS,
+    normalize_trajectory_completion,
+)
+from sql_agent.protocol import parse_response
 
 
 class _Response(io.BytesIO):
@@ -18,6 +22,49 @@ class _Response(io.BytesIO):
 
 
 class DeepSeekTextTests(unittest.TestCase):
+    def test_thinking_trajectory_stop_restores_delimiter_and_preserves_private_reasoning(self):
+        content = '<reasoning>Check schema.</reasoning><tool>{"name":"list_tables","arguments":{}}'
+        body = {"choices": [{"message": {"content": content, "reasoning_content": "private"}, "finish_reason": "stop"}]}
+        with patch("urllib.request.urlopen", return_value=_Response(json.dumps(body).encode())) as open_url:
+            result = DeepSeekClient("fake-key").complete_thinking_text([], stop_at_tool=True)
+        self.assertEqual(json.loads(open_url.call_args.args[0].data)["stop"], TRAJECTORY_STOPS)
+        self.assertEqual(result.message["content"], content + "</tool>")
+        self.assertEqual(result.message["reasoning_content"], "private")
+
+    def test_known_dsml_suffix_is_repaired_without_changing_action(self):
+        prefix = '<reasoning>Check schema.</reasoning><tool>{"name":"list_tables","arguments":{}}'
+        for pipes in ("｜", "｜｜"):
+            suffix = "\n".join(f"</{pipes}DSML{pipes} {tag}>" for tag in ("parameter", "invoke", "calls"))
+            raw = Completion({"content": prefix + suffix, "reasoning_content": "private"}, "stop", "id", "model", {"total_tokens": 5})
+            result = normalize_trajectory_completion(raw)
+            self.assertEqual(result.message["content"], prefix + "</tool>")
+            self.assertEqual(parse_response(result.message["content"])[0], "list_tables")
+            self.assertEqual(result.message["reasoning_content"], "private")
+            self.assertEqual(result.usage, raw.usage)
+            self.assertEqual(raw.message["content"], prefix + suffix)
+
+    def test_unsafe_or_incomplete_responses_are_not_repaired(self):
+        prefix = '<reasoning>Check schema.</reasoning><tool>{"name":"list_tables","arguments":{}}'
+        cases = [
+            (prefix, "length"),
+            (prefix[:-1], "stop"),
+            (prefix + " extra text", "stop"),
+            (prefix + '</tool><tool>{"name":"list_tables","arguments":{}}</tool>', "stop"),
+            (prefix.replace("Check schema.", ""), "stop"),
+            (prefix.replace('"list_tables"', '"unknown"'), "stop"),
+            (prefix + '</｜｜DSML｜｜ parameter>unexpected', "stop"),
+        ]
+        for content, finish in cases:
+            raw = Completion({"content": content}, finish, None, None, {})
+            self.assertIs(normalize_trajectory_completion(raw), raw)
+
+    def test_thinking_audit_does_not_use_trajectory_stop(self):
+        body = {"choices": [{"message": {"content": "accept"}, "finish_reason": "stop"}]}
+        with patch("urllib.request.urlopen", return_value=_Response(json.dumps(body).encode())) as open_url:
+            result = DeepSeekClient("fake-key").complete_thinking_text([])
+        self.assertNotIn("stop", json.loads(open_url.call_args.args[0].data))
+        self.assertEqual(result.message["content"], "accept")
+
     def test_incomplete_response_body_retries(self):
         class BrokenResponse(_Response):
             def read(self, *args, **kwargs):
