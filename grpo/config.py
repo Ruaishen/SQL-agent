@@ -26,6 +26,12 @@ class GrpoConfig:
     interaction_protocol: str = "legacy"
     gold_injection: bool = False
     gold_injection_max_attempts: int = 3
+    method2_guided_injection: bool = False
+    method2_max_attempts: int = 3
+    method2_audit_model: str = "deepseek-v4-flash"
+    method2_audit_key_env: str = "DEEPSEEK_API_KEY"
+    method2_audit_base_url: str = "https://api.deepseek.com"
+    method2_audit_max_tokens: int = 8192
     homogeneous_resampling_max_rollouts: int = 0
     easy_tasks: int = 0
     medium_tasks: int = 64
@@ -123,6 +129,24 @@ class GrpoConfig:
             raise ValueError("gold injection is no longer supported; use binary_execution GRPO")
         if self.gold_injection_max_attempts < 1:
             raise ValueError("gold_injection_max_attempts must be positive")
+        if self.method2_guided_injection:
+            if (
+                self.interaction_protocol != "reasoning_tool"
+                or self.reward_mode != "binary_execution"
+            ):
+                raise ValueError("method 2 requires reasoning_tool binary_execution GRPO")
+            if self.temperature != 1 or self.top_p != 1 or self.top_k not in (None, 0):
+                raise ValueError("method 2 requires temperature=1, top_p=1 and no Top-K filtering")
+            if self.kl_beta != 0 or self.homogeneous_resampling_max_rollouts:
+                raise ValueError("method 2 requires KL disabled and no homogeneous resampling")
+            if (
+                isinstance(self.method2_max_attempts, bool)
+                or not isinstance(self.method2_max_attempts, int)
+                or not 1 <= self.method2_max_attempts <= 3
+            ):
+                raise ValueError("method2_max_attempts must be an integer from 1 to 3")
+            if self.method2_audit_max_tokens < 1 or not self.method2_audit_key_env:
+                raise ValueError("method 2 requires valid audit settings")
         if self.homogeneous_resampling_max_rollouts:
             if self.reward_mode != "binary_execution":
                 raise ValueError("homogeneous resampling requires binary execution reward")
@@ -157,15 +181,16 @@ class GrpoConfig:
                 raise ValueError("curriculum source/difficulty quotas do not match task counts")
         if self.max_action_tokens >= self.max_sequence_tokens:
             raise ValueError("max_action_tokens must be below max_sequence_tokens")
-        if self.temperature <= 0 or not 0 < self.top_p <= 1 or (
-            self.top_k is not None and self.top_k < 0
+        if (
+            self.temperature <= 0
+            or not 0 < self.top_p <= 1
+            or (self.top_k is not None and self.top_k < 0)
         ):
             raise ValueError("invalid rollout sampling parameters")
         if (
             not 0 <= self.clip_ratio < 1
             or (
-                self.clip_ratio_high is not None
-                and not self.clip_ratio <= self.clip_ratio_high < 1
+                self.clip_ratio_high is not None and not self.clip_ratio <= self.clip_ratio_high < 1
             )
             or self.kl_beta < 0
         ):

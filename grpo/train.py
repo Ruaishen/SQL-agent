@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import time
 from collections import Counter
 from dataclasses import replace
@@ -22,8 +23,6 @@ from grpo.groups import (
     summarize_groups,
 )
 from grpo.loss import grpo_token_loss
-from grpo.schema_reward import SchemaRewarder
-from grpo.turn_reward import difficulty_turn_reward
 from grpo.rollout import (
     RolloutEpisode,
     RolloutTurn,
@@ -31,8 +30,10 @@ from grpo.rollout import (
     rollout_task,
     score_turns_with_teacher,
 )
+from grpo.schema_reward import SchemaRewarder
 from grpo.scoring import causal_selected_log_probs
 from grpo.tagged_rollout import rollout_tagged_task
+from grpo.turn_reward import difficulty_turn_reward
 from sql_agent.config import EnvConfig
 from sql_agent.models import TaskRecord
 
@@ -88,7 +89,9 @@ def collect_groups(
         turn_limit = config.assistant_turn_limit(task.difficulty)
         task_env_config = replace(env_config, max_turns=turn_limit)
         task_rollout_config = replace(config, max_assistant_turns=turn_limit)
-        rollout_fn = rollout_tagged_task if config.interaction_protocol == "reasoning_tool" else rollout_task
+        rollout_fn = (
+            rollout_tagged_task if config.interaction_protocol == "reasoning_tool" else rollout_task
+        )
         task_episodes = [
             rollout_fn(
                 student,
@@ -116,6 +119,19 @@ def collect_groups(
                     )
                 )
         original_successes = sum(episode.success for episode in task_episodes)
+        if config.method2_guided_injection and original_successes == 0:
+            from grpo.guided_injection import inject_guided_trajectory
+
+            candidate = inject_guided_trajectory(
+                student,
+                tokenizer,
+                task,
+                task_env_config,
+                task_rollout_config,
+                task_episodes,
+            )
+            if candidate is not None:
+                task_episodes.append(candidate)
         group_sizes.append(len(task_episodes))
         episodes.extend(task_episodes)
         execution_rewards = [float(episode.success) for episode in task_episodes]
@@ -165,10 +181,7 @@ def collect_groups(
                 [score.schema_score for score in scores],
                 coefficient=config.schema_advantage_coefficient,
                 submission_scores=[
-                    1.0
-                    if score.candidate_source == "execute_sql"
-                    else -1.0
-                    for score in scores
+                    1.0 if score.candidate_source == "execute_sql" else -1.0 for score in scores
                 ],
                 submission_coefficient=config.submission_advantage_coefficient,
                 diagnostic_eta=config.schema_diagnostic_eta,
@@ -234,7 +247,9 @@ def _episode_weights(group_sizes: list[int], *, group_equal: bool) -> list[float
     return [1.0 / episode_count] * episode_count
 
 
-def _policy_clip_counts(output, action_mask, advantages, origins: list[str]) -> dict[str, dict[str, int]]:
+def _policy_clip_counts(
+    output, action_mask, advantages, origins: list[str]
+) -> dict[str, dict[str, int]]:
     if len(origins) != action_mask.shape[0]:
         raise ValueError("clip origins must align with training turns")
     eligible = action_mask & advantages[:, None].ne(0)
@@ -242,14 +257,20 @@ def _policy_clip_counts(output, action_mask, advantages, origins: list[str]) -> 
     outside = output.clipped.bool() & action_mask
     result: dict[str, dict[str, int]] = {}
     for origin in set(origins):
-        selected = torch.tensor(
-            [value == origin for value in origins], device=action_mask.device
-        )[:, None]
-        values = torch.stack((
-            (clipped & selected).sum(), (eligible & selected).sum(),
-            (outside & selected).sum(), (action_mask & selected).sum(),
-        )).tolist()
-        result[origin] = dict(zip(("clipped", "eligible", "outside", "tokens"), values, strict=True))
+        selected = torch.tensor([value == origin for value in origins], device=action_mask.device)[
+            :, None
+        ]
+        values = torch.stack(
+            (
+                (clipped & selected).sum(),
+                (eligible & selected).sum(),
+                (outside & selected).sum(),
+                (action_mask & selected).sum(),
+            )
+        ).tolist()
+        result[origin] = dict(
+            zip(("clipped", "eligible", "outside", "tokens"), values, strict=True)
+        )
     return result
 
 
@@ -270,12 +291,17 @@ def _update_once(
     )
     group_equal = config.interaction_protocol == "reasoning_tool"
     episode_weights = _episode_weights(group_sizes, group_equal=group_equal)
-    record_weights = [weight for episode, weight in zip(episodes, episode_weights, strict=True)
-                      for _ in episode.turns]
+    record_weights = [
+        weight
+        for episode, weight in zip(episodes, episode_weights, strict=True)
+        for _ in episode.turns
+    ]
     optimizer.zero_grad(set_to_none=True)
     totals = {"loss": 0.0, "policy_loss": 0.0, "kl": 0.0, "ratio": 0.0, "clip": 0.0}
-    clip_counts = {origin: {"clipped": 0, "eligible": 0, "outside": 0, "tokens": 0}
-                   for origin in ("on_policy",)}
+    clip_counts = {
+        origin: {"clipped": 0, "eligible": 0, "outside": 0, "tokens": 0}
+        for origin in {episode.origin for episode in episodes}
+    }
     record_origins = [episode.origin for episode in episodes for _ in episode.turns]
     student.train()
     student.config.use_cache = False
@@ -294,9 +320,11 @@ def _update_once(
         )
         token_weights = torch.zeros_like(old_log_probs)
         for index, (_, _, episode_tokens) in enumerate(chunk):
-            token_weights[index] = action_mask[index].to(torch.float32) / (
-                episode_tokens
-            ) * record_weights[start + index]
+            token_weights[index] = (
+                action_mask[index].to(torch.float32)
+                / (episode_tokens)
+                * record_weights[start + index]
+            )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = student(
                 input_ids=input_ids, attention_mask=attention_mask, use_cache=False
@@ -444,12 +472,23 @@ def _save_episodes(
                 "submitted": episode.submitted,
                 "valid_actions": episode.valid_actions,
                 "total_actions": episode.total_actions,
+                "method2_info": episode.method2_info,
                 "steps": [
                     {
                         "turn": turn.turn,
                         "response": turn.response_text,
                         "observation": turn.observation,
                         "action_tokens": int(turn.action_mask.sum()),
+                        **(
+                            {
+                                "private_source_prompt_ids": turn.source_prompt_ids.tolist(),
+                                "source_action_log_probs": turn.old_log_probs[
+                                    turn.action_mask
+                                ].tolist(),
+                            }
+                            if turn.source_prompt_ids is not None
+                            else {}
+                        ),
                     }
                     for turn in episode.turns
                 ],
@@ -542,7 +581,8 @@ def _curriculum_metrics(
     for group_index, group_size in enumerate(group_sizes):
         current = sum(episode.success for episode in episodes[start : start + group_size])
         original = sum(
-            episode.success for episode in episodes[start : start + group_size]
+            episode.success
+            for episode in episodes[start : start + group_size]
             if episode.origin == "on_policy"
         )
         original_counts[f"{original}/{prior_rollouts_per_prompt}"] += 1
@@ -599,6 +639,8 @@ def main() -> None:
     parser.add_argument("--resume-from", type=Path)
     args = parser.parse_args()
     config = GrpoConfig.load(args.config)
+    if config.method2_guided_injection and not os.environ.get(config.method2_audit_key_env):
+        raise ValueError(f"Set {config.method2_audit_key_env} for the SFT/DPO independent audit")
     prepared_output_dir = config.output_dir
     if args.output_dir is not None:
         config = replace(config, output_dir=args.output_dir)
@@ -730,11 +772,25 @@ def main() -> None:
             **_resampling_metrics(groups, group_sizes, config.rollouts_per_prompt),
             "original_student_success_rate": sum(
                 episode.success for episode in episodes if episode.origin == "on_policy"
-            ) / max(1, sum(episode.origin == "on_policy" for episode in episodes)),
+            )
+            / max(1, sum(episode.origin == "on_policy" for episode in episodes)),
+            "method2_guided_attempts": sum(
+                episode.method2_info.get("attempts", 0)
+                for episode in episodes
+                if episode.origin == "on_policy"
+            )
+            / config.rollouts_per_prompt,
+            "method2_injected_trajectories": sum(
+                episode.origin == "guided_old_student" for episode in episodes
+            ),
             "original_all_zero_groups": sum(
                 detail.get("original_student_correct_count") == 0
-                for detail in reward_details if detail.get("trajectory_origin") == "on_policy"
-            ) / config.rollouts_per_prompt if config.interaction_protocol == "reasoning_tool" else None,
+                for detail in reward_details
+                if detail.get("trajectory_origin") == "on_policy"
+            )
+            / config.rollouts_per_prompt
+            if config.interaction_protocol == "reasoning_tool"
+            else None,
             **_schema_metrics(reward_details, groups, config.rollouts_per_prompt),
             **update,
             "peak_gpu_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,

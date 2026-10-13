@@ -28,6 +28,7 @@ class RolloutTurn:
     response_text: str
     observation: dict[str, Any]
     teacher_log_probs: Tensor | None = None
+    source_prompt_ids: Tensor | None = None
 
     def validate(self, *, require_teacher: bool = False) -> None:
         if self.input_ids.ndim != 1 or self.input_ids.numel() < 2:
@@ -65,6 +66,7 @@ class RolloutEpisode:
     valid_actions: int = 0
     total_actions: int = 0
     origin: str = "on_policy"
+    method2_info: dict[str, Any] = field(default_factory=dict)
 
     def validate(self, *, require_teacher: bool = False) -> None:
         if not self.turns:

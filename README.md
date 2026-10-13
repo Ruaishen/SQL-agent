@@ -200,6 +200,8 @@ python -m grpo.status --config configs/grpo_reasoning_tool_standard.yaml
 
 GRPO 会更新权重，因此如需使用它，应先完成 GRPO，再冻结最终 checkpoint 进行记忆自进化。当前 GRPO rollout 不检索经验记忆，记忆自进化也不调用 GRPO 训练。原有 JSON action 版配置和代码仍保留。
 
+新增原生方法 2 配置 `configs/grpo_method2.yaml`，继续使用本目录的 Transformers/PyTorch GRPO，不依赖 veRL。全错组由冻结旧学生复用 SFT/DPO 的 Gold 补充提示最多生成 3 次，只追加第一条执行正确且独立审核 accept 的轨迹。生成来源概率进入分母，训练输入排除私有引导。通过 `DEEPSEEK_API_KEY` 提供审核 Key；运行方式与验证边界见 [方法 2 说明](docs/grpo_method2.md)。
+
 ## 冻结权重的记忆自进化
 
 每轮使用同一学生 checkpoint 和冻结的记忆快照：
