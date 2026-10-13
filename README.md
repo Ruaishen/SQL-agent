@@ -2,6 +2,42 @@
 
 基于 Spider 1.0 的多轮 Text-to-SQL 项目。当前主线是：构造完整推理与工具轨迹 → SFT → 可选 DPO / GRPO → 冻结最终模型权重 → 只追加经学生重试验证的经验记忆。
 
+## 实测结果
+
+基础模型为 **Qwen2.5-Coder-3B-Instruct**。以下结果来自顺序执行的 SFT → DPO → 标准 Binary GRPO，均为全参数更新；不是随机交替 SFT/DPO 实验，也未启用 GRPO 方法 2 的引导轨迹注入。
+
+评测使用 Spider 官方开发集对应的 `data/external_dev.jsonl`，共 **1034 题**，不是 `internal_validation` 或 `internal_holdout`。三个阶段使用相同的任务文件、system prompt 和 `ExecutionVerifier`，不检索经验记忆：temperature=0、每轮最多生成 512 tokens、上下文上限 16384 tokens，最多 10 次探索，另保留一次提交；探索预算耗尽时可由评测器提交最后执行的 SQL。
+
+| 阶段 | 训练数据与更新次数 | 正确题数 | 执行准确率 | 相对上一阶段 |
+|---|---|---:|---:|---:|
+| SFT | 3000 条正确轨迹，2 个 epoch | 741/1034 | **71.66%** | — |
+| SFT → DPO | 1131 对长度筛选后的完整轨迹，2 个 epoch | 745/1034 | **72.05%** | +0.39 个百分点 |
+| SFT → DPO → GRPO | 500 道新训练题，125 步，每题采样 6 条轨迹 | 765/1034 | **73.98%** | +1.93 个百分点 |
+
+分难度正确题数：
+
+| 难度 | 题数 | SFT | SFT → DPO | SFT → DPO → GRPO |
+|---|---:|---:|---:|---:|
+| easy | 248 | 223 | 227 | 224 |
+| medium | 446 | 334 | 326 | 337 |
+| hard | 174 | 110 | 109 | 124 |
+| extra | 166 | 74 | 83 | 80 |
+
+本次实验配置：
+
+- **SFT**：从原 7000 条轨迹中的正确样本分层抽取 3000 条，easy/medium/hard/extra 分别为 600/1200/600/600；抽样 seed=42，逐条重新执行 SQL 核验。峰值学习率 `1e-5`，5 步 warmup 后余弦衰减，有效 batch 为 64 个 assistant 回合，共 444 步。
+- **DPO**：从上述 SFT 权重开始，冻结参考模型同样初始化为该 SFT 权重。学习率 `1e-6`、β=0.1、每次更新累计 4 对，共 566 步；分支分数累加完整轨迹的 assistant token log-probability，不按长度平均。
+- **GRPO**：从上述 DPO 权重开始，从原 7000 题中另抽 500 题，easy/medium/hard/extra 分别为 100/200/100/100。题号及同库同问题均与 SFT、DPO 数据不重叠；每步 4 题、每题 6 条轨迹，500 题各使用一次，共 3000 条在线轨迹。学习率 `1e-6`，temperature=1、top_p=0.99，采用 clip-higher：`clip_ratio=0.2`、`clip_ratio_high=0.28`，概率比裁剪区间为 `[0.8, 1.28]`；`kl_beta=0`，不加载 KL 参考模型。未启用 Gold 引导注入。
+
+三个阶段的训练数据库与 `external_dev` 数据库不重叠。训练源使用官方 `train_spider.json` 的 7000 题范围，不能据此推定这些 checkpoint 与预处理得到的内部验证/保留集也没有重叠。本次标准 GRPO 实测使用本地实验脚本将同题 6 条轨迹并行生成，维护 FP32 主权重并导出 BF16 checkpoint；该并行封装不是 `grpo.train` 原生命令的默认采样方式。
+
+结果依据以下本地产物核对，`artifacts/` 不纳入 Git，也不随代码分发：
+
+- `artifacts/experiments/sft3000_dpo1131_2epoch_20261012T060640Z/accuracy.json`
+- `artifacts/experiments/grpo500_restart_batched_20261013T004639Z/accuracy.json`
+
+下文配置文件是可编辑的运行模板，并非上述实测配置的完整复现文件。
+
 ## 项目结构
 
 | 目录 | 用途 |
@@ -9,15 +45,13 @@
 | `sql_agent/` | 只读 SQLite 环境、工具、执行验证器、公共提示词与解析器、DeepSeek 客户端 |
 | `sft/` | 原始轨迹采集、Gold 辅助完整重生成、筛选、学生 tokenizer 转换和 SFT 训练 |
 | `dpo/` | 完整轨迹偏好配对、固定样本生成、特定实验恢复、参考分数缓存与 DPO 训练 |
-| `grpo/` | 保留的在线 Binary GRPO 与 reasoning/tool rollout |
+| `grpo/` | 在线 Binary GRPO、reasoning/tool rollout、可选全错组引导轨迹注入 |
 | `experience_memory/` | 通用经验检索、教师反思、学生重试、成功入库和多轮续跑 |
 | `evaluation/` | 学生推理与评测、基线对照和历史评测辅助工具 |
 | `data/`、`configs/` | 数据划分和运行配置 |
 | `artifacts/` | 本地生成数据、记忆库、模型和实验记录，不纳入 Git |
 
-已移除 SQL-Planner 包、其命令与专属测试，以及旧 DPO 相关入口。被 SFT、GRPO 和记忆流程共同使用的能力迁入公共模块。历史 `artifacts/sql_planner/` 数据保留，目录名属于历史产物路径，新运行推荐使用 `artifacts/sft/` 和 `artifacts/experience_memory/`。
-
-当前完整轨迹 DPO 实现位于 `dpo/`，与已移除的旧入口独立。数据构造、训练及恢复规则见下文；目标公式和详细说明见 [完整轨迹 DPO](docs/dpo_full_trajectory.md)。
+公共环境、协议和执行验证位于 `sql_agent/`；完整轨迹 DPO 位于 `dpo/`。历史 `artifacts/sql_planner/` 仅作为本地数据产物路径使用。DPO 目标公式和详细说明见 [完整轨迹 DPO](docs/dpo_full_trajectory.md)。
 
 ## 环境和数据划分
 
@@ -40,22 +74,20 @@ python -m data.preprocess_spider --config-path configs/env.yaml
 
 公共协议位于 `sql_agent/protocol.py`。从头重生成时保留来源轨迹的原 system 提示词，避免悄悄改变已确认的 SFT 条件。
 
-## 新的 SFT 数据构造
+## SFT 数据构造
 
-按“SFT 数据”对话已确认的方案，数据由两类完整轨迹组成：
+构造器支持两类完整轨迹：
 
 1. 原始执行正确轨迹：保留真实 reasoning、工具调用和 observation。
 2. 原始错题的 Gold 辅助完整重生成：先验证 Gold 可执行，从原问题重新开始，不复用错误前缀，也不从分叉点续写。
 
-教师重生成使用 DeepSeek Flash 文本模型、thinking enabled、reasoning effort high。生成时保留原 system 提示词，在教师上下文中追加已确认的补充提示；Gold 与补充提示不进入学生消息。私有 `reasoning_content` 只在教师调用间重放并单独归档。
+教师重生成通过 DeepSeek 客户端调用 `--model` 指定的模型，默认 thinking enabled、reasoning effort high。生成时保留原 system 提示词，在教师上下文中追加 `sft/prompts/gold_repair_supplement_zh.md`；Gold 与补充提示不进入学生消息。私有 `reasoning_content` 只在教师调用间重放并单独归档。
 
 重生成必须真实执行并提交所提供 Gold，两个工具参数中解码后的 SQL 字符串与 Gold 完全一致，包括空白、别名和分号。成功执行该 SQL 后，下一轮提交相同 SQL。不能靠字符串替换或编造 observation 得到正确轨迹。
 
-独立审核只接收学生可见消息，按照已确认的提示词仅输出 `accept` 或 `reject`。只保存执行验证通过、审核为 `accept` 的候选；拒绝后重新生成，不能删词或改写 reasoning 来包装合格数据。审核存在漏检可能，`accept` 只代表通过该次审核。
+独立审核输入包含原问题、学生可见消息及 `trajectory_comparison` 统计对比，不包含教师私有 Gold 补充。审核须仅输出 `accept` 或 `reject`。只保存执行验证通过、审核为 `accept` 的候选；拒绝后重新生成，不能删词或改写 reasoning 来包装合格数据。审核存在漏检可能，`accept` 只代表通过该次审核。
 
-此前发现的“calibration query”漏检由用户另行处理，本次不额外修补该项，也不复核或改写已有产物。
-
-已确认的教师补充和审核提示保存在 `sft/prompts/`。以下命令会调用 API；密钥仅从环境变量 `DEEPSEEK_API_KEY` 读取，不写入仓库。
+教师补充和审核提示保存在 `sft/prompts/`。以下命令会调用 API；密钥仅从环境变量 `DEEPSEEK_API_KEY` 读取，不写入仓库。
 
 ### 采集原始轨迹（已有原始数据可跳过）
 
@@ -72,21 +104,21 @@ python -m sft.collect_reasoning \
 
 ```bash
 python -m sft.regenerate_reasoning \
-  --source artifacts/sql_planner/reasoning \
+  --source artifacts/sft/original \
   --tasks data/train.jsonl --env-config configs/env.yaml \
   --spider-root /path/to/spider_data --model deepseek-flash \
   --output-dir artifacts/sft/gold_regenerated \
   --attempts 3 --limit 100
 ```
 
-保存各次尝试和私有教师记录，正式 `trajectories/` 仅写审核通过的学生可见轨迹。同一参数支持续跑；失败候选不混入正式源数据。已有批量任务及其输出继续保留，本次不重新调用 API。
+保存各次尝试和私有教师记录，正式 `trajectories/` 仅写审核通过的学生可见轨迹。同一参数支持复用已有接受结果和尝试记录；失败候选不混入正式源数据。
 
 ### 筛选、去重和执行复核
 
 ```bash
 python -m sft.curate_reasoning \
-  --original artifacts/sql_planner/reasoning \
-  --regenerated artifacts/sql_planner/reasoning_gold_repair_flash_high_v3 \
+  --original artifacts/sft/original \
+  --regenerated artifacts/sft/gold_regenerated \
   --tasks data/train.jsonl --env-config configs/env.yaml \
   --spider-root /path/to/spider_data --output artifacts/sft/curated
 ```
@@ -107,7 +139,7 @@ python -m sft.train_status --config configs/sft_reasoning.yaml
 
 先修改 `configs/sft_reasoning.yaml` 中的学生模型路径。使用学生 tokenizer 和 chat template 转换，完整轨迹的所有 assistant reasoning/action 轮参与监督；system、user、工具 observation 不计算目标 loss。现有训练器按轨迹的监督 token 数归一化，避免长轨迹仅因长度获得更大权重。
 
-旧分叉 Gold 修复的后缀监督规则不进入新数据主线。数据转换拒绝旧 `gold_repair` 后缀记录，并对序列长度、提示词一致性和训练划分做检查。SFT 阶段更新模型权重；训练结束后选择 checkpoint，再进入冻结权重阶段。
+旧分叉 Gold 修复的后缀监督规则不进入新数据主线。数据转换拒绝旧 `gold_repair` 后缀记录，并对序列长度、提示词一致性和训练划分做检查。SFT 阶段更新模型权重；训练后可继续 DPO/GRPO，再冻结最终 checkpoint 用于评测或记忆自进化。
 
 ## 完整轨迹 DPO（可选阶段）
 
@@ -125,13 +157,13 @@ DPO 使用同一 system prompt 和原问题组成偏好对，训练完整多轮 
 ```bash
 # 1. 从原始错题重新生成 chosen，复用 SFT 验证和审核。
 python -m sft.regenerate_reasoning \
-  --source data/reasoning --tasks data/train.jsonl \
+  --source artifacts/sft/original --tasks data/train.jsonl \
   --env-config configs/env.yaml --spider-root /path/to/spider_data \
   --model deepseek-flash --output-dir artifacts/dpo/gold_regenerated
 
 # 2. 回放 chosen 的工具轨迹并复核 rejected，保存完整偏好对。
 python -m dpo.pairs \
-  --original data/reasoning --regenerated artifacts/dpo/gold_regenerated \
+  --original artifacts/sft/original --regenerated artifacts/dpo/gold_regenerated \
   --tasks data/train.jsonl --env-config configs/env.yaml \
   --spider-root /path/to/spider_data --output artifacts/dpo/pairs.jsonl
 ```
@@ -142,7 +174,7 @@ python -m dpo.pairs \
 
 ```bash
 python -m dpo.pilot prepare \
-  --source data/reasoning --spider-root /path/to/spider_data \
+  --source artifacts/sft/original --spider-root /path/to/spider_data \
   --tokenizer /path/to/sft-checkpoint --env-config configs/env.yaml \
   --output artifacts/dpo/pilot_100 --count 100 --seed 42
 python -m dpo.pilot run \
@@ -153,13 +185,9 @@ python -m dpo.pilot run \
 
 `prepare` 固定样本、源文件哈希和运行配置；它按原轨迹的 `split=train` 选题，再从 Spider 原始文件恢复任务，因此应先核对来源划分与评测集隔离。`run` 支持 enabled/disabled 两种生成模式，审核仍使用 thinking/high，每题仅一次生成尝试。已完成结果可复用，已有尝试但缺少结果的任务记为 `interrupted_attempt`，不自动增加尝试次数。结果、私有 API 记录、token 用量和保留比例分别写入运行目录；密钥缺失时交互输入。
 
-### 特定实验的恢复验证
+### 历史 DPO 恢复脚本
 
-`dpo/recover.py` 当前是固定路径的实验脚本，读取 `artifacts/dpo/nonthinking_full1907_20261012/失败原因复查.json`，要求选中 87 个已有正确提交和 60 个待继续案例，写入新的 `artifacts/dpo/recovery147_20261012/`。这些数量是脚本的选择断言，不代表最终接受或保留数量；实际结果以生成的 `report.json` 为准。
-
-恢复时回放已有工具前缀并比对保存的 observation；已有正确提交直接验证，待继续案例从保存的响应继续真实执行。候选仍须通过静态检查与独立泄露审核。配对调用 `build(..., strict_submission=False)`，放宽 Gold 精确字符串和紧邻执行要求，但仍检查公开消息与工具记录一致、提交 SQL 与 `final_sql` 一致，以及完整执行结果正确。报告以 `live_execution_result_equivalence` 标明此验证方式。
-
-该脚本需要已有实验文件和交互输入 API 密钥；通用 `dpo.pairs` 命令仍采用严格验证，未提供恢复模式的命令行开关。
+`dpo/recover.py` 是针对固定历史实验路径的恢复脚本，依赖对应的失败复查文件和 API 密钥，不是通用中断续训入口。它回放已有工具前缀，复核 observation 和最终 SQL，并进行独立泄露审核；配对时可使用 `strict_submission=False`，以真实执行结果一致性代替 Gold 字符串及紧邻执行要求。常规 `dpo.pairs` CLI 仍使用严格验证。详见 [完整轨迹 DPO](docs/dpo_full_trajectory.md)。
 
 ### Tokenization、参考缓存与训练
 
@@ -188,15 +216,19 @@ python -m dpo.train train \
 
 配对、tokenization、参考缓存和训练要求新的输出路径。当前训练支持单设备、梯度检查点和梯度裁剪，不提供多卡或中断续训入口；输出 `metrics.jsonl`、训练 `manifest.json` 和最终 `checkpoint/`。完成 DPO 后再冻结最终权重进入记忆自进化，DPO 训练本身不调用记忆新增流程。
 
-## GRPO（保留的可选阶段）
+## GRPO（在线强化学习）
 
 ```bash
 python -m grpo.prepare --config configs/grpo_reasoning_tool_standard.yaml
-python -m grpo.train --config configs/grpo_reasoning_tool_standard.yaml
+python -m grpo.train --config configs/grpo_reasoning_tool_standard.yaml --max-steps 128
 python -m grpo.status --config configs/grpo_reasoning_tool_standard.yaml
 ```
 
-运行前修改该配置的 Student、Reference、数据和输出路径。GRPO 在线采样多轮轨迹，以 SQL 执行正确性产生 binary reward，只更新生成 action token；不向策略注入 Gold。
+运行前修改配置中的 `student_model`、`reference_model`、`train_data`、`output_dir`，并设置 `configs/env.yaml` 的实际数据路径。训练命令必须显式传入 `--max-steps`，不能超过配置中的 `max_steps`。
+
+标准 Binary GRPO 在线采样多轮轨迹，按 SQL 执行正确性产生 0/1 奖励，计算组内标准化优势；一组全部正确或全部错误时，标准二值奖励的优势为零。损失作用于模型生成的回复 token，屏蔽提示、工具观察和特殊 token；使用新旧策略概率比的逐 token 裁剪，可配置非对称上界 `clip_ratio_high`。标准模式不向策略注入 Gold。
+
+`kl_beta=0` 时不计算 KL，也不加载参考模型；配置校验仍要求 `reference_model` 路径存在，可与 `student_model` 相同。支持全参数更新、显存不足时降低 micro-batch、按 `checkpoint_interval` 保存，以及 `--resume-from` 恢复权重和步数。当前恢复会重新创建 AdamW 优化器，不恢复其动量状态。原生采样基于 Transformers `model.generate()`，不依赖 veRL。
 
 GRPO 会更新权重，因此如需使用它，应先完成 GRPO，再冻结最终 checkpoint 进行记忆自进化。当前 GRPO rollout 不检索经验记忆，记忆自进化也不调用 GRPO 训练。原有 JSON action 版配置和代码仍保留。
 
@@ -216,11 +248,11 @@ GRPO 会更新权重，因此如需使用它，应先完成 GRPO，再冻结最�
 
 候选经验不提前进入正式库。写入时读取两次记录，要求正确性严格分别为 false 和 true，再重新执行两条 SQL 验证。重试须由学生实际提交，评测器兜底提交不满足入库条件。超时、Gold 异常和没有最终 SQL 的失败跳过。
 
-每条记忆只保存：`memory_id`、`question`、`experience`、`sql_before`、`sql_after`、`source_task_id`、`source_split`、`initial_record_path`、`retry_record_path`。`question` 保存完整来源问题原文，`experience` 只保存标题含义、适用条件和改进建议；默认只编码 `question` 召回，检索上下文仍包含原题和经验。不设数据库专属条目。修改后 SQL 来自学生成功重试。
+记忆字段包括：`memory_id`、`question`、`experience`、`sql_before`、`sql_first_execute`、`sql_after`、`source_task_id`、`source_split`、`initial_record_path`、`retry_record_path`。`question` 保存完整来源问题原文，`experience` 只保存标题含义、适用条件和改进建议；默认只编码 `question` 召回，检索上下文仍包含原题和经验；评测入口还支持按经验文本或 SQL 检索，提供 embedding、TF-IDF 和 SQL BM25 选项。不设数据库专属条目。修改后 SQL 来自学生成功重试；`sql_first_execute` 保存首次实际执行的 SQL，无执行记录时为 null，旧记录可缺少此字段。
 
 不在记忆条目中保存正确性标记、模型名、记忆版本、检索 ID、时间、轮次或候选 ID。必要的模型配置和验证证据独立保存在实验记录中。
 
-默认检索使用 `Qwen/Qwen3-Embedding-0.6B` 对待解问题和记忆的 `question` 编码，按归一化向量的余弦相似度召回；支持中英文跨语言匹配。命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 5 条、仅取正相似度，记忆上下文预算默认 8192 tokens。Embedding 权重冻结，默认 CPU、batch size 8、编码长度上限 2048 tokens；超长文本编码时截断。首次非空检索下载模型，离线可用 `--embedding-model /path/to/Qwen3-Embedding-0.6B`，GPU 可用 `--embedding-device cuda:0`。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
+默认检索使用 `Qwen/Qwen3-Embedding-0.6B` 对待解问题和记忆的 `question` 编码，按归一化向量的余弦相似度召回。命中后提供正文及前后 SQL 示例，提醒映射当前 schema。默认最多 5 条、仅取正相似度，记忆上下文预算默认 8192 tokens。Embedding 权重冻结，默认 CPU、batch size 8、编码长度上限 2048 tokens；超长文本编码时截断。首次非空检索下载模型，离线可用 `--embedding-model /path/to/Qwen3-Embedding-0.6B`，GPU 可用 `--embedding-device cuda:0`。记忆不自动修订、停用或合并；同一证据对的重复处理仅作续跑幂等保护。
 
 ```bash
 python -m experience_memory.evolve \
